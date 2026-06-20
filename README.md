@@ -72,9 +72,11 @@ explicitly, holding it to the same exhaustive-test bar as the TS source.
   silently weakening replay protection. A WebID resolution failure in `strict` mode is a 401.
 - **SSRF-safe WebID resolution.** The address classifier refuses loopback / RFC 1918 / CGNAT /
   link-local / multicast / TEST-NET / IPv4-mapped-IPv6 / IPv6 ULA / 6to4-embedding-private-v4 /
-  NAT64-embedding-private-v4, and the per-record loop refuses a hostname if **any** resolved record is
-  non-public (DNS-rebinding mitigation). M1 ships the classifier + the URL gate; M2 wires the DNS-pinned
-  fetch around them.
+  NAT64-embedding-private-v4 (RFC 6052, the well-known `64:ff9b::/96` prefix — operator-defined
+  Network-Specific Prefixes are NOT speculatively matched, as their layout is indistinguishable
+  from legitimate sparse global IPv6 and would over-block), and the per-record loop refuses a
+  hostname if **any** resolved record is non-public (DNS-rebinding mitigation). M1 ships the classifier
+  + the URL gate; M2 wires the DNS-pinned fetch around them.
 - **Non-leaky errors.** Client-facing `error_description`s never disclose token bytes or SSRF/network
   detail. The bidirectional check returns a *constant* message so it cannot be used as a
   reconnaissance oracle. `WWW-Authenticate` names the trusted issuer(s) so a client knows where to get a

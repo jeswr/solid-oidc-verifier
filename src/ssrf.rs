@@ -4,8 +4,13 @@
 //!
 //! Refuses: loopback, link-local, IPv4 private (RFC 1918), CGNAT (RFC 6598), IPv4 reserved/test
 //! ranges, multicast, broadcast, `0.0.0.0/8`, IPv4-mapped IPv6, IPv6 ULA (`fc00::/7`), IPv6
-//! unspecified, **6to4 (`2002::/16`) embedding a private v4**, **NAT64 (`64:ff9b::/96`) embedding a
-//! private v4**. `allow_loopback` re-permits loopback only (dev / IT).
+//! unspecified, **6to4 (`2002::/16`) embedding a private v4**, and **NAT64 (RFC 6052) embedding a
+//! private v4 at the IANA well-known prefix `64:ff9b::/96`**. Operator-defined NAT64
+//! Network-Specific Prefixes (NSPs) are deliberately NOT matched: their layout (RFC 6052 §2.2)
+//! has no globally-known structural discriminator, so speculatively reading a private v4 out of
+//! every address that *could* be an NSP embedding would false-block legitimate sparse global IPv6.
+//! An operator that runs a custom NSP fronts it with its own egress policy. `allow_loopback`
+//! re-permits loopback only (dev / IT).
 //!
 //! The verifier's WebID resolution uses this to refuse a profile URL that resolves to a non-public
 //! address (the DNS-rebinding + private-network guard, TS risk R5). M1 implements the classifier (the
@@ -134,7 +139,9 @@ fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
     if (high & 0xff00) == 0xff00 {
         return false;
     }
-    // 2002::/16 6to4 — encodes a v4 in segments[1..3]. Block when the embedded v4 is non-public.
+    // 2002::/16 6to4 — encodes a v4 in segments[1..3]. This is a recognized transition mechanism, so
+    // it is FULLY classified by its embedded v4 (and is terminal — we must not also run the
+    // speculative NAT64-NSP framing on it, which would mis-read the zero-filled low half).
     if high == 0x2002 {
         let v4 = Ipv4Addr::new(
             (segments[1] >> 8) as u8,
@@ -142,12 +149,35 @@ fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
             (segments[2] >> 8) as u8,
             (segments[2] & 0xff) as u8,
         );
+        return is_public_ipv4(v4, allow_loopback);
+    }
+    // NAT64 (RFC 6052) — the IANA **well-known** prefix `64:ff9b::/96` ONLY. It embeds a 32-bit
+    // IPv4 in the last two segments, so an attacker could smuggle a private/loopback v4
+    // (169.254/16, 127/8, 10/8, …) inside `64:ff9b::<priv-v4>` to slip past IPv6 classification —
+    // we extract that v4 and reject if it is non-public. The well-known prefix is a fixed, globally
+    // known value, so this check is exact and cannot over-block.
+    //
+    // Operator-defined Network-Specific Prefixes (NSPs) at the shorter §2.2 lengths
+    // (/32../64) are deliberately NOT speculatively matched. We do not know the operator's NSP, and
+    // RFC 6052 §2.2's only structural invariants (a zero reserved "u" octet + a zero suffix) are
+    // ALSO satisfied by ordinary sparse global-unicast IPv6 allocations — so reading a candidate
+    // v4 out of every such address would FALSE-BLOCK legitimate IPv6 whose interpreted candidate
+    // merely happens to land in a private range (e.g. `2001:db8:a00:1::`, a valid global address,
+    // would be read as embedding 10.0.0.1 under the /32 framing). The SSRF guard must never refuse
+    // a legitimate public address, so we check only the well-known /96. An operator running a
+    // custom NSP is responsible for its own egress policy.
+    if let Some(v4) = nat64_well_known_embedded_v4(&segments) {
         if !is_public_ipv4(v4, allow_loopback) {
             return false;
         }
     }
-    // 64:ff9b::/96 NAT64 well-known prefix (RFC 6052): segments [0..6) == [64, ff9b, 0, 0, 0, 0],
-    // last 32 bits a v4. Block when the embedded v4 is non-public.
+    true
+}
+
+/// Extract the IPv4 embedded by the **well-known** NAT64 prefix `64:ff9b::/96` (RFC 6052 §2.1):
+/// segments `[64, ff9b, 0, 0, 0, 0]` then a 32-bit v4 in the last two segments. Returns `None` when
+/// the address is not under that exact prefix.
+fn nat64_well_known_embedded_v4(segments: &[u16; 8]) -> Option<Ipv4Addr> {
     if segments[0] == 0x0064
         && segments[1] == 0xff9b
         && segments[2] == 0
@@ -155,17 +185,14 @@ fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
         && segments[4] == 0
         && segments[5] == 0
     {
-        let v4 = Ipv4Addr::new(
+        return Some(Ipv4Addr::new(
             (segments[6] >> 8) as u8,
             (segments[6] & 0xff) as u8,
             (segments[7] >> 8) as u8,
             (segments[7] & 0xff) as u8,
-        );
-        if !is_public_ipv4(v4, allow_loopback) {
-            return false;
-        }
+        ));
     }
-    true
+    None
 }
 
 #[cfg(test)]
@@ -243,8 +270,74 @@ mod tests {
 
     #[test]
     fn rejects_nat64_embedding_private_v4() {
-        // 64:ff9b::10.0.0.1
+        // 64:ff9b::10.0.0.1 (well-known prefix)
         assert!(!is_public_address("64:ff9b::0a00:0001", false));
+    }
+
+    /// Build an IPv6 string from raw octets so NAT64 layouts are exact (no hand-formatting slips).
+    fn v6_from_octets(o: [u8; 16]) -> String {
+        Ipv6Addr::from(o).to_string()
+    }
+
+    #[test]
+    fn rejects_nat64_well_known_various_private_v4() {
+        // RFC 6052 §2.1 well-known prefix 64:ff9b::/96 embedding non-public v4s.
+        assert!(!is_public_address("64:ff9b::7f00:0001", false)); // 127.0.0.1 loopback
+        assert!(!is_public_address("64:ff9b::a9fe:a9fe", false)); // 169.254.169.254 link-local metadata
+        assert!(!is_public_address("64:ff9b::0a00:0001", false)); // 10.0.0.1 RFC1918
+    }
+
+    #[test]
+    fn accepts_nat64_well_known_embedding_public_v4() {
+        // Well-known prefix embedding a PUBLIC v4 (8.8.8.8) → allowed.
+        assert!(is_public_address("64:ff9b::0808:0808", false)); // 8.8.8.8
+    }
+
+    #[test]
+    fn accepts_custom_nsp_shaped_ipv6_no_speculative_false_block() {
+        // SECURITY-CORRECTNESS: the SSRF guard must NOT false-block a legitimate global IPv6 just
+        // because, read under some hypothetical operator NSP framing, its bytes COULD spell a
+        // private v4. We do not know any operator's NSP, and these structurally-NAT64-shaped
+        // addresses are byte-for-byte indistinguishable from ordinary sparse global allocations —
+        // so every one of them must classify PUBLIC (only the IANA well-known /96 is matched).
+        //
+        // Each of the following previously tripped the removed speculative /32../64 matching
+        // (zero u-octet + zero suffix + a private-looking candidate) and was WRONGLY refused.
+
+        // /32-shaped: 2001:db8:a00:1:: — octets 4..=7 = 0a 00 00 01 = "10.0.0.1", suffix all zero.
+        let mut o32 = [0u8; 16];
+        o32[0..4].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8]);
+        o32[4..8].copy_from_slice(&[0x0a, 0x00, 0x00, 0x01]); // would-be 10.0.0.1 under /32
+        assert!(is_public_address(&v6_from_octets(o32), false));
+
+        // /64-shaped: 2001:db8:1:2:0:a9fe:a9fe — octets 9..=12 = "169.254.169.254", suffix zero.
+        let mut o64 = [0u8; 16];
+        o64[0..8].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0x00, 0x01, 0x00, 0x02]);
+        o64[9..13].copy_from_slice(&[0xa9, 0xfe, 0xa9, 0xfe]); // would-be 169.254.169.254 under /64
+        assert!(is_public_address(&v6_from_octets(o64), false));
+
+        // /48-shaped: octets 6,7 then 9,10 = "10.0.0.1" under /48, u-octet + suffix zero.
+        let mut o48 = [0u8; 16];
+        o48[0..6].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0xca, 0xfe]);
+        o48[6] = 0x0a;
+        o48[7] = 0x00;
+        o48[9] = 0x00;
+        o48[10] = 0x01;
+        assert!(is_public_address(&v6_from_octets(o48), false)); // would-be 10.0.0.1 under /48
+
+        // /64-shaped embedding a loopback-looking v4 (127.0.0.1) — still PUBLIC, not blocked.
+        let mut olo = [0u8; 16];
+        olo[0..8].copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0xab, 0xcd, 0x00, 0x00]);
+        olo[9..13].copy_from_slice(&[0x7f, 0x00, 0x00, 0x01]); // would-be 127.0.0.1 under /64
+        assert!(is_public_address(&v6_from_octets(olo), false));
+    }
+
+    #[test]
+    fn accepts_genuine_public_ipv6_no_nat64_false_block() {
+        // Real public IPv6 addresses must not be misread as NAT64-embedded private v4s.
+        assert!(is_public_address("2606:4700:4700::1111", false)); // cloudflare
+        assert!(is_public_address("2001:4860:4860::8888", false)); // google dns
+        assert!(is_public_address("2620:fe::fe", false)); // quad9
     }
 
     #[test]
