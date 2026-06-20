@@ -8,6 +8,13 @@
 //! [`prod-solid-server`](https://github.com/jeswr/prod-solid-server) (`src/auth/`) onto vetted Rust
 //! primitives. Carve-out #2 of the Rust-migration spike — the single load-bearing security blocker.
 //!
+//! ## ⚠️ EXPERIMENTAL
+//! This crate is part of an **experimental** Rust-server track and does **not** replace the production
+//! TypeScript `prod-solid-server` (the live, supported server). APIs may change; not yet recommended
+//! for production. M2 proceeds without gating on a Rust-competent external reviewer (maintainer
+//! decision 2026-06-20) — the codex/roborev review still runs and security-critical paths are
+//! adversarially self-reviewed.
+//!
 //! ## What it verifies
 //! - **RFC 9068 `at+jwt` access tokens**: JWS signature against the issuer's JWKS, an asymmetric-only
 //!   `alg`, `typ=at+jwt`, the required claims, the trusted `iss`, the expected `aud`, and `exp`/`nbf`/

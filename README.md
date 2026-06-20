@@ -1,6 +1,13 @@
 <!-- AUTHORED-BY Claude Opus 4.8 -->
 # solid-oidc-verifier
 
+> ⚠️ **EXPERIMENTAL.** This crate is part of an **experimental** Rust-server track and is **not** a
+> replacement for the production TypeScript [`prod-solid-server`](https://github.com/jeswr/prod-solid-server),
+> which remains the live, supported server. APIs may change; not yet recommended for production. Because
+> it is experimental, M2 proceeds without gating on a Rust-competent external reviewer (the standard
+> codex/roborev review still runs, and security-critical paths are adversarially self-reviewed).
+> Maintainer decision 2026-06-20.
+
 A standalone, **issuer-agnostic**, DPoP-bound **Solid-OIDC resource-server access-token verifier** in
 Rust. It is a behavioural port of the vetted TypeScript verifier in
 [`prod-solid-server`](https://github.com/jeswr/prod-solid-server) (`src/auth/`) onto vetted Rust
@@ -9,9 +16,11 @@ which identified the DPoP/Solid-OIDC verifier as **the single load-bearing secur
 Rust rewrite (risk R1). If this crate clears the auth bar, the rest of a rewrite is comparatively
 ordinary porting; if it cannot, the rewrite is do-not-proceed.
 
-> Status: **M1** — the verification core + all security-critical logic, exhaustively tested. The
-> network adapters (OIDC discovery/JWKS fetch, the DNS-pinning WebID fetch) are clean trait seams that
-> land in M2. License: dual `MIT OR Apache-2.0`. **crates.io publish is deferred — consume via git.**
+> Status: **M1 complete; M2 in progress** (experimental). M1 = the verification core + all
+> security-critical logic, exhaustively tested. M2 = the network adapters (OIDC discovery/JWKS fetch,
+> the DNS-pinning WebID fetch) behind the existing clean trait seams, the ath-patched Solid CTH shim,
+> and the Keycloak DPoP integration test. License: dual `MIT OR Apache-2.0`. **crates.io publish is
+> deferred — consume via git.**
 
 ## Why
 
