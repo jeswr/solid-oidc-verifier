@@ -220,3 +220,42 @@ fn classify_redirect_to_private_refused() {
     // A redirect Location re-validated against the gate: a redirect to a private literal is refused.
     assert!(ssrf_gate_static("https://10.1.2.3/redirected", false).is_err());
 }
+
+/// Finding #4 (Medium): strict/warn bidirectional mode WITHOUT a resolver must FAIL at construction —
+/// it must not silently skip the WebID↔issuer check. (Use `Off` to deliberately disable it.)
+#[test]
+fn strict_without_resolver_fails_construction() {
+    let issuer = KeyKit::generate();
+    // A config with strict mode but no resolver wired (bypassing the `bidirectional()` setter).
+    let mut cfg = VerifierConfig::new(vec![ISSUER.to_string()], AUDIENCE).require_dpop(true);
+    cfg.bidirectional_mode = BidirectionalMode::Strict;
+    // webid_resolver stays None.
+    let replay = InMemoryReplayStore::with_window(cfg.replay_ttl());
+    let result = Verifier::new(cfg, jwks_provider(ISSUER, &issuer), replay);
+    assert!(
+        result.is_err(),
+        "strict mode without a resolver must be rejected"
+    );
+}
+
+#[test]
+fn warn_without_resolver_fails_construction() {
+    let issuer = KeyKit::generate();
+    let mut cfg = VerifierConfig::new(vec![ISSUER.to_string()], AUDIENCE).require_dpop(true);
+    cfg.bidirectional_mode = BidirectionalMode::Warn;
+    let replay = InMemoryReplayStore::with_window(cfg.replay_ttl());
+    let result = Verifier::new(cfg, jwks_provider(ISSUER, &issuer), replay);
+    assert!(
+        result.is_err(),
+        "warn mode without a resolver must be rejected"
+    );
+}
+
+#[test]
+fn off_without_resolver_is_fine() {
+    let issuer = KeyKit::generate();
+    let cfg = VerifierConfig::new(vec![ISSUER.to_string()], AUDIENCE).require_dpop(true);
+    // bidirectional_mode defaults to Off, no resolver — construction succeeds.
+    let replay = InMemoryReplayStore::with_window(cfg.replay_ttl());
+    assert!(Verifier::new(cfg, jwks_provider(ISSUER, &issuer), replay).is_ok());
+}

@@ -141,7 +141,7 @@ match verifier.verify(&req) {
 | DPoP RFC-9449 proof validation | ✅ implemented + tested | — |
 | RFC 7638 `cnf.jkt` thumbprint | ✅ implemented + tested | — |
 | `ath` three-state compat | ✅ implemented + tested | — |
-| `jti` replay (trait + in-memory, fail-closed) | ✅ implemented + tested | shared Redis impl (`ReplayStore`) |
+| `jti` replay (trait + in-memory: atomic check-and-set, never-evict-live, fail-closed at capacity) | ✅ implemented + tested | shared Redis `SET NX` impl (`ReplayStore`) |
 | SSRF address classifier + URL gate | ✅ implemented + tested | — |
 | JWKS provider (trait + static) | ✅ implemented + tested | `openidconnect` discovery + cached JWKS fetch (`JwksProvider`) |
 | WebID resolver (trait + fixture) + bidirectional check | ✅ implemented + tested | `reqwest`+`hickory-resolver` DNS-pinned fetch (`WebIdResolver`) |

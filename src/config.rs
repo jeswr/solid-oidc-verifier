@@ -133,6 +133,19 @@ impl VerifierConfig {
                 "an audience (the resource server's identity) is required".into(),
             ));
         }
+        // (Finding #4, roborev Medium) A strict/warn bidirectional mode without a resolver would
+        // SILENTLY skip the WebID↔issuer check — a security policy disabled by misconfiguration.
+        // Refuse it: if the operator asked for the check, a resolver MUST be wired (use
+        // `BidirectionalMode::Off` to deliberately disable it).
+        if matches!(
+            self.bidirectional_mode,
+            BidirectionalMode::Strict | BidirectionalMode::Warn
+        ) && self.webid_resolver.is_none()
+        {
+            return Err(ConfigError(
+                "bidirectional mode strict/warn requires a webid_resolver (use Off to disable the check)".into(),
+            ));
+        }
         Ok(())
     }
 

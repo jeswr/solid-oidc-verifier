@@ -1660,3 +1660,104 @@ fn challenge_names_trusted_issuer() {
     assert!(challenge.contains(ISSUER));
     assert!(challenge.starts_with("DPoP "));
 }
+
+// ---------------------------------------------------------------------------------------------
+// roborev round-1 regressions
+// ---------------------------------------------------------------------------------------------
+
+/// Finding #1 (High): a cnf-bound token presented as `Bearer` with `require_dpop=false` MUST still be
+/// rejected without a proof — otherwise a captured bound token replays as a bearer token (downgrade).
+#[test]
+fn rejects_cnf_bound_token_as_bearer_even_when_dpop_not_required() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(false)); // require_dpop = false
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    // Bearer presentation, NO DPoP proof — must be refused because the token is cnf-bound.
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+        },
+        "dpop proof is required",
+    );
+}
+
+/// Finding #1 (High): the same cnf-bound token presented as `Bearer` WITH a valid proof + the right
+/// htu/htm/ath/cnf is accepted (proof-of-possession satisfied) even when `require_dpop=false`.
+#[test]
+fn accepts_cnf_bound_bearer_when_a_valid_proof_is_supplied() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(false));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    let creds = v
+        .verify(&AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+        })
+        .unwrap();
+    assert_eq!(creds.web_id.as_deref(), Some(WEBID));
+}
+
+/// Finding #5 (Medium): a token with NO `iat` claim is rejected (RFC 9068 requires it).
+#[test]
+fn rejects_token_missing_iat() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    // Build a token by hand with no iat (the helper always sets iat, so sign directly).
+    use serde_json::json;
+    let header = json!({ "alg": "ES256", "typ": "at+jwt" });
+    let exp = now_for_test() + 300;
+    let claims = json!({
+        "iss": ISSUER, "sub": WEBID, "jti": "no-iat-jti", "client_id": CLIENT_ID,
+        "aud": AUDIENCE, "webid": WEBID, "cnf": { "jkt": client.thumbprint }, "exp": exp,
+    });
+    let token = issuer.sign(&header, &claims);
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+        },
+        "missing iat",
+    );
+}

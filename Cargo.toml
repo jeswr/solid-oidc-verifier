@@ -21,8 +21,9 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 url = "2"
-# jti replay store: in-memory TTL cache.
-moka = { version = "0.12", features = ["sync"] }
+# Note: the in-memory jti replay store uses only std (Mutex<HashMap>) so it can fail CLOSED at
+# capacity and offer an atomic check-and-set — see src/replay.rs. A shared (Redis SET NX) store is
+# the M2 `ReplayStore` impl.
 
 [dev-dependencies]
 # Test-only key generation + JWS minting (mirrors the TS `jose` test helpers).

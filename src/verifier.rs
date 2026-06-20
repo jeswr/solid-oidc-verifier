@@ -185,28 +185,32 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         claimed_issuer: &str,
         dpop: bool,
     ) -> Result<Claims, VerifyError> {
-        let ath_compat = self.config.allow_missing_ath
-            && dpop
-            && req
-                .dpop
-                .as_deref()
-                .map(|p| !proof_has_ath(p))
-                .unwrap_or(false);
-
         // Access-token signature + RFC-9068 claims (same in both strict and compat — the difference is
         // only the proof's ath requirement).
         let claims = self.validate_access_token(parsed, claimed_issuer)?;
 
-        if dpop {
+        // (Finding #1, roborev High) A DPoP-BOUND token (carrying `cnf.jkt`) MUST have its proof
+        // verified regardless of the presentation scheme or `require_dpop`. Otherwise a captured
+        // bound token presented as `Bearer` (when `require_dpop=false`) would be accepted without
+        // proof-of-possession — a token-replay downgrade. So `must_dpop` is true whenever the request
+        // is DPoP-scheme / DPoP-required OR the token itself is cnf-bound. (The `oauth4webapi` library
+        // the TS verifier delegates to enforces exactly this: it runs its DPoP step whenever the token
+        // carries `cnf.jkt`.)
+        let cnf_jkt = extract_cnf_jkt(&claims);
+        let must_dpop = dpop || cnf_jkt.is_some();
+
+        if must_dpop {
             let proof = req.dpop.as_deref().ok_or_else(|| {
                 invalid_token_dpop("DPoP proof is required (no DPoP HTTP Header).")
             })?;
-            let cnf_jkt = extract_cnf_jkt(&claims).ok_or_else(|| {
+            let cnf_jkt = cnf_jkt.ok_or_else(|| {
                 invalid_token_dpop(
                     "Access token is not DPoP-bound (no cnf.jkt confirmation claim).",
                 )
             })?;
-            // require_ath: strict unless we are on the opted-in compat path for an ath-less proof.
+            // ath-compat path: opted in AND the presented proof omits `ath` (a present-but-wrong ath
+            // still takes the strict path and is rejected).
+            let ath_compat = self.config.allow_missing_ath && !proof_has_ath(proof);
             let require_ath = !ath_compat;
             self.validate_dpop_proof(req, proof, &parsed.token, &cnf_jkt, require_ath)?;
         }
@@ -358,11 +362,20 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
                 ));
             }
         }
-        if let Some(iat) = claims.get("iat").and_then(Value::as_i64) {
-            // A token issued in the (far) future is rejected.
-            if iat - tol > now {
+        // (Finding #5, roborev Medium) `iat` is REQUIRED (RFC 9068 §2.2 + the doc contract). A missing
+        // or non-integer `iat` is `invalid_token`, not silently accepted.
+        match claims.get("iat").and_then(Value::as_i64) {
+            Some(iat) => {
+                // A token issued in the (far) future is rejected.
+                if iat - tol > now {
+                    return Err(invalid_token(
+                        "Access token verification failed: iat in the future.",
+                    ));
+                }
+            }
+            None => {
                 return Err(invalid_token(
-                    "Access token verification failed: iat in the future.",
+                    "Access token verification failed: missing iat.",
                 ));
             }
         }
@@ -428,14 +441,23 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
     }
 
     /// Bidirectional WebID↔issuer check (ADR-0004 #3). Strict → 401 (constant client message) on any
-    /// mismatch/fetch-failure; warn → accept; off / no resolver → no-op.
+    /// mismatch/fetch-failure; warn → accept; off → no-op. Construction forbids strict/warn without a
+    /// resolver, so a `None` resolver here can only mean `Off`.
     fn check_bidirectional(&self, web_id: &str, issuer: &str) -> Result<(), VerifyError> {
         if self.config.bidirectional_mode == BidirectionalMode::Off {
             return Ok(());
         }
         let resolver = match &self.config.webid_resolver {
             Some(r) => r,
-            None => return Ok(()),
+            // (Finding #4) Strict/warn without a resolver is rejected at construction. Defensively,
+            // if we somehow reach here in strict mode, FAIL CLOSED rather than skip the check.
+            None => {
+                return if self.config.bidirectional_mode == BidirectionalMode::Strict {
+                    Err(invalid_token("WebID issuer check failed."))
+                } else {
+                    Ok(())
+                };
+            }
         };
         let listed: bool = match resolver.resolve(&canonicalise_profile_url(web_id)) {
             Ok(profile) => profile.issuers.contains(issuer),
