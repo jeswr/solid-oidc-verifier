@@ -54,13 +54,15 @@ pub trait ReplayStore: Send + Sync {
 /// for one process.
 pub struct InMemoryReplayStore {
     inner: Mutex<HashMap<String, Instant>>,
-    max_entries: usize,
+    /// Live-entry cap, kept as `u64` for API stability (converted to `usize` internally). A NEW `jti`
+    /// at capacity fails closed rather than evicting a live entry.
+    max_entries: u64,
 }
 
 impl InMemoryReplayStore {
     /// Build a store capped at `max_entries` live `jti`s. `ttl` is supplied per-mark (the verifier
     /// always uses `max_age + tolerance`), so no construction-time TTL is needed.
-    pub fn new(max_entries: usize, _ttl: Duration) -> Self {
+    pub fn new(max_entries: u64, _ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
             max_entries,
@@ -72,7 +74,13 @@ impl InMemoryReplayStore {
         Self::new(100_000, ttl)
     }
 
-    /// Remove expired entries (lazy GC). Called under the lock at each mark.
+    /// The cap as a `usize` (saturating, so a `u64` larger than `usize::MAX` clamps rather than wraps).
+    fn cap(&self) -> usize {
+        usize::try_from(self.max_entries).unwrap_or(usize::MAX)
+    }
+
+    /// Remove expired entries (lazy GC). Called ONLY when the map is at/over capacity, so the common
+    /// path is O(1), and the O(n) sweep amortises to once per ~capacity inserts (roborev round-2).
     fn prune_expired(map: &mut HashMap<String, Instant>, now: Instant) {
         map.retain(|_, &mut expiry| expiry > now);
     }
@@ -86,27 +94,30 @@ impl ReplayStore for InMemoryReplayStore {
             .lock()
             .map_err(|_| ReplayBackendError("replay store mutex poisoned".into()))?;
 
-        // An existing, still-live entry → replay. (An expired entry is treated as fresh — pruned below.)
-        if let Some(&expiry) = map.get(jti) {
-            if expiry > now {
-                return Ok(MarkResult::Replay);
-            }
+        // An existing entry → replay if still live; if expired, treat as fresh and overwrite below.
+        match map.get(jti) {
+            Some(&expiry) if expiry > now => return Ok(MarkResult::Replay),
+            _ => {}
         }
-
-        // Prune expired entries so live capacity reflects only entries still in their window.
-        Self::prune_expired(&mut map, now);
 
         // A non-positive TTL means the proof is already past its window: treat as fresh and do not
         // store (the freshness check rejects it independently). Otherwise record.
         if ttl > Duration::ZERO {
-            // Fail CLOSED at capacity (Finding #2): never evict a live `jti` to make room — that would
-            // reopen the replay window. Refuse the new entry so the verifier returns 503; the operator
-            // must scale the shared (Redis) store. The capacity is large (100k default) so this is an
-            // overload signal, not a normal path.
-            if !map.contains_key(jti) && map.len() >= self.max_entries {
-                return Err(ReplayBackendError(
-                    "replay store at capacity; refusing to evict live jti (fail-closed)".into(),
-                ));
+            let cap = self.cap();
+            // Only sweep expired entries when we're about to exceed capacity (O(1) common path; the
+            // O(n) prune amortises to ~once per `cap` inserts). A re-insert of an existing key never
+            // grows the map, so it skips the capacity gate.
+            if !map.contains_key(jti) && map.len() >= cap {
+                Self::prune_expired(&mut map, now);
+                // After pruning live-only, if STILL at capacity, fail CLOSED — never evict a live
+                // `jti` to make room (that would reopen the replay window). The verifier returns 503;
+                // the operator must scale the shared (Redis) store. With a 100k default this is an
+                // overload signal, not a normal path.
+                if map.len() >= cap {
+                    return Err(ReplayBackendError(
+                        "replay store at capacity; refusing to evict live jti (fail-closed)".into(),
+                    ));
+                }
             }
             map.insert(jti.to_string(), now + ttl);
         }
@@ -187,6 +198,28 @@ mod tests {
         assert_eq!(
             store.mark("a", Duration::from_secs(305)).unwrap(),
             MarkResult::Replay
+        );
+    }
+
+    #[test]
+    fn capacity_prune_frees_expired_entries() {
+        // Capacity 2, short TTL. Fill to capacity, let them expire, then a NEW jti at capacity must
+        // succeed (the at-capacity prune frees the expired ghosts) — a legit high-volume client is
+        // not blocked by dead entries (roborev round-2 Medium: prune at capacity, not every call).
+        let store = InMemoryReplayStore::new(2, Duration::from_millis(20));
+        assert_eq!(
+            store.mark("a", Duration::from_millis(20)).unwrap(),
+            MarkResult::New
+        );
+        assert_eq!(
+            store.mark("b", Duration::from_millis(20)).unwrap(),
+            MarkResult::New
+        );
+        std::thread::sleep(Duration::from_millis(60)); // both expire
+                                                       // At capacity by count, but both are expired → the prune frees them → this succeeds.
+        assert_eq!(
+            store.mark("c", Duration::from_millis(20)).unwrap(),
+            MarkResult::New
         );
     }
 
