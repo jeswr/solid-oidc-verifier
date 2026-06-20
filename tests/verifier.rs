@@ -1482,17 +1482,19 @@ fn multi_issuer_no_cross_acceptance() {
 // JWKS resolution failures → 401 (not 500)
 // ---------------------------------------------------------------------------------------------
 
+/// The sensitive-looking SSRF/DNS/URL detail a real network JwksProvider error might carry. The
+/// client-facing message MUST NOT contain ANY of these tokens (roborev round-2 Low).
+const LEAKY_JWKS_DETAIL: &str =
+    "OIDC discovery failed: 10.0.0.7 https://idp.internal:8443/.well-known/openid-configuration HTTP 503";
+
 struct FailingProvider;
 impl JwksProvider for FailingProvider {
     fn keys_for(&self, _issuer: &str) -> Result<Vec<Jwk>, JwksError> {
-        Err(JwksError(
-            "OIDC discovery for issuer failed: HTTP 503".into(),
-        ))
+        Err(JwksError(LEAKY_JWKS_DETAIL.into()))
     }
 }
 
-#[test]
-fn jwks_resolution_failure_is_401() {
+fn jwks_failure_request() -> (Verifier<FailingProvider, InMemoryReplayStore>, AuthRequest) {
     let issuer = KeyKit::generate();
     let client = KeyKit::generate();
     let cfg = config(true);
@@ -1514,16 +1516,54 @@ fn jwks_resolution_failure_is_401() {
             ..Default::default()
         },
     );
-    assert_401(
-        &v,
-        &AuthRequest {
+    (
+        v,
+        AuthRequest {
             authorization: Some(format!("DPoP {token}")),
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
         },
-        "verification failed",
-    );
+    )
+}
+
+#[test]
+fn jwks_resolution_failure_is_401() {
+    let (v, req) = jwks_failure_request();
+    assert_401(&v, &req, "verification failed");
+}
+
+/// REGRESSION (roborev round-2 Low): a JWKS-resolution failure must surface the EXACT constant
+/// client-facing message and leak NONE of the provider's internal SSRF/DNS/URL detail (the
+/// reconnaissance-oracle guard). This would FAIL if the old leaky `{e}` interpolation returned.
+#[test]
+fn jwks_resolution_failure_message_is_constant_and_non_leaky() {
+    let (v, req) = jwks_failure_request();
+    let err = v.verify(&req).expect_err("must reject");
+    assert_eq!(err.status(), 401);
+    // The message is EXACTLY the constant — not the leaky detail interpolated into it.
+    assert_eq!(err.message(), "Access token verification failed.");
+    // And it contains none of the sensitive tokens (host, private IP, URL, status).
+    for needle in [
+        "10.0.0.7",
+        "idp.internal",
+        ".well-known",
+        "503",
+        LEAKY_JWKS_DETAIL,
+    ] {
+        assert!(
+            !err.message().contains(needle),
+            "client message leaked internal detail: {needle:?}"
+        );
+    }
+    // The WWW-Authenticate challenge (which embeds the description) must also be clean.
+    let challenge = v.www_authenticate(&err);
+    for needle in ["10.0.0.7", "idp.internal", ".well-known"] {
+        assert!(
+            !challenge.contains(needle),
+            "WWW-Authenticate leaked internal detail: {needle:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
