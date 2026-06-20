@@ -106,6 +106,20 @@ fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
         return is_public_ipv4(v4, allow_loopback);
     }
 
+    // IPv4-COMPATIBLE ::a.b.c.d (deprecated, RFC 4291 ::/96): segments[0..6] all zero, last 32 bits a
+    // v4. NOT caught by `to_ipv4_mapped` (which requires the ::ffff: prefix), so without this an
+    // address like `::10.0.0.1` would classify as public. `::1`/`::` are already handled above, so any
+    // remaining all-zero-high address carries a non-trivial embedded v4 — classify per it.
+    if segments[0..6].iter().all(|&s| s == 0) {
+        let v4 = Ipv4Addr::new(
+            (segments[6] >> 8) as u8,
+            (segments[6] & 0xff) as u8,
+            (segments[7] >> 8) as u8,
+            (segments[7] & 0xff) as u8,
+        );
+        return is_public_ipv4(v4, allow_loopback);
+    }
+
     let high = segments[0];
 
     // fe80::/10 link-local
@@ -208,6 +222,17 @@ mod tests {
         assert!(!is_public_address("::ffff:127.0.0.1", false));
         // expanded form
         assert!(!is_public_address("0:0:0:0:0:ffff:0a00:0001", false)); // = 10.0.0.1
+    }
+
+    #[test]
+    fn rejects_ipv4_compatible_private_v6() {
+        // Deprecated RFC 4291 ::a.b.c.d (IPv4-COMPATIBLE, not ::ffff:) — NOT caught by to_ipv4_mapped.
+        // Classified per the embedded v4 so an internal target can't slip through (SSRF audit Low).
+        assert!(!is_public_address("::10.0.0.1", false)); // ::0a00:0001 → 10/8 private
+        assert!(!is_public_address("::169.254.169.254", false)); // link-local metadata
+        assert!(!is_public_address("::127.0.0.1", false)); // loopback (allow_loopback=false)
+                                                           // A public embedded v4 still classifies public (per the embedded address).
+        assert!(is_public_address("::8.8.8.8", false));
     }
 
     #[test]

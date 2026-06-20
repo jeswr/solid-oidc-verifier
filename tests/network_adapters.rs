@@ -34,6 +34,9 @@ use solid_oidc_verifier::config::{JwksProvider, NetworkJwksProvider};
 use solid_oidc_verifier::net::{HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher};
 use solid_oidc_verifier::webid::{NetworkWebIdResolver, WebIdResolver};
 
+/// Serializes tests that mutate process-global proxy env vars so they can't race each other.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A deterministic resolver mapping host → records (the test/adversarial DNS seam).
 struct MapResolver {
     map: HashMap<String, Vec<IpAddr>>,
@@ -343,4 +346,61 @@ async fn discovery_issuer_mismatch_is_refused() {
         .await
         .unwrap();
     assert!(err.is_err(), "a discovery issuer mismatch must be refused");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambient_proxy_env_is_ignored_dns_pin_holds() {
+    // Regression for the SSRF-audit HIGH: reqwest defaults to honouring HTTP(S)_PROXY/ALL_PROXY, which
+    // would route via the proxy and bypass our DNS-pin + per-record classification entirely. The
+    // SafeFetcher must call `.no_proxy()`. Set a DEAD proxy (nothing listens on :1); the fetch must
+    // STILL reach the pinned loopback server — proving the proxy env was ignored. If `.no_proxy()` were
+    // missing, reqwest would CONNECT to 127.0.0.1:1 and the fetch would fail.
+    let jwks = r#"{"keys":[{"kty":"EC","crv":"P-256","x":"f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU","y":"x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"}]}"#;
+    let (addr, _shutdown) = start_server_with(|addr| {
+        let origin = format!("http://idp.test:{}", addr.port());
+        let discovery = format!(r#"{{"issuer":"{origin}/","jwks_uri":"{origin}/jwks"}}"#);
+        let mut routes = HashMap::new();
+        routes.insert(
+            "/.well-known/openid-configuration".to_string(),
+            Reply::Ok("application/json", discovery),
+        );
+        routes.insert(
+            "/jwks".to_string(),
+            Reply::Ok("application/json", jwks.to_string()),
+        );
+        routes
+    })
+    .await;
+    let issuer = format!("http://idp.test:{}/", addr.port());
+    let provider = NetworkJwksProvider::with_fetcher(
+        SafeFetcher::with_resolver(
+            MapResolver::new(&[("idp.test", &["127.0.0.1"])]),
+            loopback_cfg(),
+        ),
+        std::time::Duration::from_secs(60),
+    );
+    let keys = tokio::task::spawn_blocking(move || {
+        // Proxy env is process-global. Serialize env-mutating tests via a shared lock and RESTORE the
+        // prior values (don't clobber a dev/CI proxy config). Everything is inside the blocking closure
+        // so the lock is never held across an .await. (The lock + restore make this order-independent.)
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_https = std::env::var_os("HTTPS_PROXY");
+        let prev_all = std::env::var_os("ALL_PROXY");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:1");
+        std::env::set_var("ALL_PROXY", "http://127.0.0.1:1");
+        let r = provider.keys_for(&issuer);
+        match prev_https {
+            Some(v) => std::env::set_var("HTTPS_PROXY", v),
+            None => std::env::remove_var("HTTPS_PROXY"),
+        }
+        match prev_all {
+            Some(v) => std::env::set_var("ALL_PROXY", v),
+            None => std::env::remove_var("ALL_PROXY"),
+        }
+        r
+    })
+    .await
+    .unwrap()
+    .expect("fetch must succeed despite ambient proxy env (no_proxy honoured; DNS-pin holds)");
+    assert_eq!(keys.len(), 1);
 }

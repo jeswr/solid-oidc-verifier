@@ -210,6 +210,13 @@ impl<R: HostResolver> SafeFetcher<R> {
             let mut builder = reqwest::blocking::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(self.config.timeout)
+                // CRITICAL SSRF invariant: disable ambient proxy config. reqwest defaults to honouring
+                // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars; with a proxy set, reqwest connects to the
+                // PROXY and sends `CONNECT <target>`, so the proxy (not us) resolves the target — which
+                // bypasses our DNS-pin + per-record SSRF classification entirely. This fetcher controls
+                // its own egress; it must NOT inherit ambient proxy config. (Without this, a single
+                // HTTPS_PROXY env var turns the whole guard into a no-op.)
+                .no_proxy()
                 // Defence-in-depth: even though we pin, also forbid reqwest from following redirects on
                 // its own and cap the connect time within the overall timeout.
                 .connect_timeout(self.config.timeout);

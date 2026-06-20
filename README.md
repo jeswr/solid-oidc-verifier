@@ -2,8 +2,8 @@
 # solid-oidc-verifier
 
 > ⚠️ **EXPERIMENTAL.** This crate is part of an **experimental** Rust-server track and is **not** a
-> replacement for the production TypeScript [`prod-solid-server`](https://github.com/jeswr/prod-solid-server),
-> which remains the live, supported server. APIs may change; not yet recommended for production. Because
+> replacement for the existing TypeScript [`prod-solid-server`](https://github.com/jeswr/prod-solid-server),
+> This crate's APIs may change; it is not yet recommended for production. Because
 > it is experimental, M2 proceeds without gating on a Rust-competent external reviewer (the standard
 > codex/roborev review still runs, and security-critical paths are adversarially self-reviewed).
 > Maintainer decision 2026-06-20.

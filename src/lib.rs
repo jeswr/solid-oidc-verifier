@@ -10,7 +10,7 @@
 //!
 //! ## ⚠️ EXPERIMENTAL
 //! This crate is part of an **experimental** Rust-server track and does **not** replace the production
-//! TypeScript `prod-solid-server` (the live, supported server). APIs may change; not yet recommended
+//! TypeScript `prod-solid-server`. APIs may change; not yet recommended
 //! for production. M2 proceeds without gating on a Rust-competent external reviewer (maintainer
 //! decision 2026-06-20) — the codex/roborev review still runs and security-critical paths are
 //! adversarially self-reviewed.
