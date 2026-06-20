@@ -251,6 +251,8 @@ async fn redirect_to_metadata_literal_is_refused_end_to_end() {
 #[tokio::test(flavor = "multi_thread")]
 async fn webid_profile_happy_path_extracts_issuer() {
     let mut routes = HashMap::new();
+    // The `#me` subject (resolved against the document base) must match the WebID we resolve with —
+    // proving the subject-scoping accepts the WebID's OWN oidcIssuer triple.
     let ttl = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
 <#me> solid:oidcIssuer <https://idp.example/realms/solid> ."#;
     routes.insert(
@@ -258,16 +260,44 @@ async fn webid_profile_happy_path_extracts_issuer() {
         Reply::Ok("text/turtle", ttl.to_string()),
     );
     let (addr, _shutdown) = start_server(routes).await;
-    let profile_url = format!("http://pod.test:{}/alice", addr.port());
+    // Resolve with the FULL WebID (fragment intact); the resolver canonicalises to /alice for the GET.
+    let web_id = format!("http://pod.test:{}/alice#me", addr.port());
     let resolver = NetworkWebIdResolver::with_fetcher(SafeFetcher::with_resolver(
         MapResolver::new(&[("pod.test", &["127.0.0.1"])]),
         loopback_cfg(),
     ));
-    let profile = tokio::task::spawn_blocking(move || resolver.resolve(&profile_url))
+    let profile = tokio::task::spawn_blocking(move || resolver.resolve(&web_id))
         .await
         .unwrap()
         .expect("profile fetch should succeed");
     assert!(profile.issuers.contains("https://idp.example/realms/solid"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn webid_profile_ignores_a_different_subjects_issuer_end_to_end() {
+    // SECURITY (roborev High), end-to-end: a profile listing the trusted issuer for an UNRELATED
+    // subject must NOT satisfy resolution for the claimed WebID.
+    let mut routes = HashMap::new();
+    let ttl = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+<https://pod.example/eve#me> solid:oidcIssuer <https://idp.example/realms/solid> ."#;
+    routes.insert(
+        "/alice".to_string(),
+        Reply::Ok("text/turtle", ttl.to_string()),
+    );
+    let (addr, _shutdown) = start_server(routes).await;
+    let web_id = format!("http://pod.test:{}/alice#me", addr.port());
+    let resolver = NetworkWebIdResolver::with_fetcher(SafeFetcher::with_resolver(
+        MapResolver::new(&[("pod.test", &["127.0.0.1"])]),
+        loopback_cfg(),
+    ));
+    let profile = tokio::task::spawn_blocking(move || resolver.resolve(&web_id))
+        .await
+        .unwrap()
+        .expect("fetch should succeed (parse ok) but yield no issuer for THIS webid");
+    assert!(
+        !profile.issuers.contains("https://idp.example/realms/solid"),
+        "a different subject's issuer must not count for this WebID"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

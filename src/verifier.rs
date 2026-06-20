@@ -31,9 +31,7 @@ use crate::jwt::{
     verify_signature, Claims,
 };
 use crate::replay::{MarkResult, ReplayStore};
-use crate::webid::{
-    canonicalise_profile_url, validate_webid_claim, BidirectionalMode, WebIdProfileError,
-};
+use crate::webid::{validate_webid_claim, BidirectionalMode, WebIdProfileError};
 
 /// The per-request inputs (TS `AuthRequest`). The host's HTTP layer assembles this; the verifier is
 /// transport-agnostic. `url` is the exact reconstructed request URL (proxy-aware, query stripped) the
@@ -245,10 +243,15 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
             return Err(invalid_token(crate::jwk::ES512_KNOWN_NARROWING));
         }
 
+        // (roborev Medium) A JWKS-resolution failure may carry SSRF/DNS/host detail (a private resolved
+        // address, the discovery/jwks URL). That detail is for INTERNAL logging only — NEVER the
+        // client-facing message. Map any `JwksError` to a CONSTANT public description so a verification
+        // failure cannot become an SSRF reconnaissance oracle. (`_e` is dropped here; a host that wants
+        // the detail logs it at the provider boundary.)
         let keys = self
             .jwks
             .keys_for(claimed_issuer)
-            .map_err(|e| invalid_token(format!("Access token verification failed: {e}")))?;
+            .map_err(|_e| invalid_token("Access token verification failed."))?;
 
         let claims = verify_signature(&parsed.token, &keys, Some("at+jwt")).map_err(|e| {
             invalid_token(format!("Access token verification failed: {}", e.message()))
@@ -473,7 +476,11 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
                 };
             }
         };
-        let listed: bool = match resolver.resolve(&canonicalise_profile_url(web_id)) {
+        // Pass the FULL WebID (fragment intact). The resolver canonicalises to the profile-document URL
+        // for the fetch but MUST scope the `solid:oidcIssuer` triples to the WebID subject — a profile
+        // listing the issuer for a DIFFERENT subject must NOT satisfy the check for this WebID
+        // (roborev High; mirrors TS `extractIssuers(quads, webId, profileUrl)`).
+        let listed: bool = match resolver.resolve(web_id) {
             Ok(profile) => profile.issuers.contains(issuer),
             Err(WebIdProfileError(_)) => false,
         };

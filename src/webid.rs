@@ -31,10 +31,15 @@ pub struct WebIdProfile {
 #[error("{0}")]
 pub struct WebIdProfileError(pub String);
 
-/// Resolves a WebID URL to its profile's issuer set. The network implementation (M2) DNS-pins,
-/// re-validates redirects, bounds the body, and refuses non-public addresses; a test/embedded
-/// implementation can resolve from a fixture map. Mirrors the `WebIdResolver` seam.
+/// Resolves a **WebID** (the full IRI, fragment intact) to its profile's issuer set. The implementation
+/// canonicalises the WebID to the profile-document URL for the fetch, but MUST scope the collected
+/// `solid:oidcIssuer` objects to triples whose SUBJECT is the WebID itself (or the document URL) — a
+/// profile listing the issuer for an unrelated subject must NOT satisfy the check for this WebID. The
+/// network implementation (M2) DNS-pins, re-validates redirects, bounds the body, and refuses
+/// non-public addresses; a test/embedded implementation can resolve from a fixture map. Mirrors the TS
+/// `WebIdResolver` seam (`resolve(webId)` → `extractIssuers(quads, webId, profileUrl)`).
 pub trait WebIdResolver: Send + Sync {
+    /// `web_id` is the FULL WebID IRI (with fragment), not the canonicalised profile URL.
     fn resolve(&self, web_id: &str) -> Result<WebIdProfile, WebIdProfileError>;
 }
 
@@ -196,25 +201,37 @@ impl<R: crate::net::HostResolver> NetworkWebIdResolver<R> {
 #[cfg(feature = "network")]
 impl<R: crate::net::HostResolver> WebIdResolver for NetworkWebIdResolver<R> {
     fn resolve(&self, web_id: &str) -> Result<WebIdProfile, WebIdProfileError> {
-        // The caller passes the already-canonicalised profile URL (fragment + userinfo stripped); the
-        // SafeFetcher re-applies the full static gate defensively at every hop.
+        // Canonicalise the FULL WebID to the profile-document URL we GET (fragment + userinfo stripped);
+        // the SafeFetcher re-applies the full static gate defensively at every hop.
+        let profile_url = canonicalise_profile_url(web_id);
         let resp = self
             .fetcher
             // Prefer Turtle; many servers also content-negotiate. We parse Turtle only (see doc above).
-            .get(web_id, "text/turtle, application/x-turtle;q=0.9, */*;q=0.1")
+            .get(
+                &profile_url,
+                "text/turtle, application/x-turtle;q=0.9, */*;q=0.1",
+            )
             .map_err(|e| WebIdProfileError(format!("WebID profile fetch failed: {}", e.0)))?;
-        let issuers = parse_oidc_issuers(&resp.body, &resp.final_url)?;
+        // Scope the issuer triples to the WebID subject (or the document URL) — NOT any subject.
+        let issuers = parse_oidc_issuers(&resp.body, &resp.final_url, web_id, &profile_url)?;
         Ok(WebIdProfile { issuers })
     }
 }
 
-/// Parse a Turtle profile body and collect every `solid:oidcIssuer` object that is a NamedNode IRI.
-/// Uses the streaming `oxttl` parser (bounded — the body is already byte-capped upstream). A literal
-/// (non-IRI) object of the predicate is ignored (an issuer must be an IRI). A syntax error aborts with
-/// a coarse error — we never echo the parse detail to the client.
+/// Parse a Turtle profile body and collect `solid:oidcIssuer` NamedNode objects **only from triples
+/// whose subject is the WebID itself or the profile-document URL** (the subject-scoping that prevents a
+/// profile from satisfying the bidirectional check by listing the issuer for an unrelated subject —
+/// roborev High; mirrors TS `extractIssuers(quads, webId, profileUrl)`). Uses the streaming `oxttl`
+/// parser (bounded — the body is already byte-capped upstream). A literal (non-IRI) object is ignored
+/// (an issuer must be an IRI). A syntax error aborts with a coarse error — never echoed to the client.
 #[cfg(feature = "network")]
-fn parse_oidc_issuers(body: &[u8], base_url: &str) -> Result<HashSet<String>, WebIdProfileError> {
-    use oxrdf::Term;
+fn parse_oidc_issuers(
+    body: &[u8],
+    base_url: &str,
+    web_id: &str,
+    profile_url: &str,
+) -> Result<HashSet<String>, WebIdProfileError> {
+    use oxrdf::{Subject, Term};
     use oxttl::TurtleParser;
 
     let mut parser = TurtleParser::new();
@@ -228,10 +245,20 @@ fn parse_oidc_issuers(body: &[u8], base_url: &str) -> Result<HashSet<String>, We
     for triple in parser.for_slice(body) {
         let triple = triple
             .map_err(|_| WebIdProfileError("WebID profile is not valid Turtle.".to_string()))?;
-        if triple.predicate.as_str() == SOLID_OIDC_ISSUER {
-            if let Term::NamedNode(n) = &triple.object {
-                issuers.insert(n.as_str().to_string());
-            }
+        if triple.predicate.as_str() != SOLID_OIDC_ISSUER {
+            continue;
+        }
+        // Subject MUST be the WebID (full IRI) or the profile-document URL — a different subject's
+        // oidcIssuer triple is ignored.
+        let subject_iri = match &triple.subject {
+            Subject::NamedNode(n) => n.as_str(),
+            _ => continue, // blank-node / quoted-triple subjects can't be the WebID
+        };
+        if subject_iri != web_id && subject_iri != profile_url {
+            continue;
+        }
+        if let Term::NamedNode(n) = &triple.object {
+            issuers.insert(n.as_str().to_string());
         }
     }
     Ok(issuers)
@@ -311,18 +338,54 @@ mod tests {
     }
 
     #[cfg(feature = "network")]
+    const WEBID: &str = "https://pod.example/alice/profile/card#me";
+    #[cfg(feature = "network")]
+    const PROFILE: &str = "https://pod.example/alice/profile/card";
+
+    #[cfg(feature = "network")]
     #[test]
-    fn parse_oidc_issuers_extracts_namednode_objects() {
+    fn parse_oidc_issuers_extracts_namednode_objects_for_the_webid_subject() {
         let ttl = br#"
             @prefix solid: <http://www.w3.org/ns/solid/terms#> .
             <https://pod.example/alice/profile/card#me>
                 solid:oidcIssuer <https://idp.example/realms/solid> ,
                                  <https://other-idp.example/> .
         "#;
-        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice/profile/card").unwrap();
+        let issuers = parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).unwrap();
         assert!(issuers.contains("https://idp.example/realms/solid"));
         assert!(issuers.contains("https://other-idp.example/"));
         assert_eq!(issuers.len(), 2);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_accepts_document_subject() {
+        // A profile that asserts the issuer on the DOCUMENT URL (not the #me node) is also honoured
+        // (TS `subjectIri === profileUrl`).
+        let ttl = br#"
+            @prefix solid: <http://www.w3.org/ns/solid/terms#> .
+            <https://pod.example/alice/profile/card>
+                solid:oidcIssuer <https://idp.example/realms/solid> .
+        "#;
+        let issuers = parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).unwrap();
+        assert!(issuers.contains("https://idp.example/realms/solid"));
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_ignores_a_different_subject() {
+        // SECURITY (roborev High): a `solid:oidcIssuer` triple on an UNRELATED subject must NOT count
+        // toward the WebID's issuer set — else a profile could satisfy the bidirectional check for the
+        // claimed WebID by listing the trusted issuer under some other subject.
+        let ttl = br#"
+            @prefix solid: <http://www.w3.org/ns/solid/terms#> .
+            <https://pod.example/eve#me> solid:oidcIssuer <https://idp.example/realms/solid> .
+        "#;
+        let issuers = parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).unwrap();
+        assert!(
+            issuers.is_empty(),
+            "an unrelated subject's oidcIssuer must be ignored"
+        );
     }
 
     #[cfg(feature = "network")]
@@ -332,9 +395,9 @@ mod tests {
         // never coerced into the issuer set (else a profile could "list" an arbitrary string).
         let ttl = br#"
             @prefix solid: <http://www.w3.org/ns/solid/terms#> .
-            <https://pod.example/alice#me> solid:oidcIssuer "https://idp.example/realms/solid" .
+            <https://pod.example/alice/profile/card#me> solid:oidcIssuer "https://idp.example/realms/solid" .
         "#;
-        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice").unwrap();
+        let issuers = parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).unwrap();
         assert!(issuers.is_empty());
     }
 
@@ -343,9 +406,9 @@ mod tests {
     fn parse_oidc_issuers_empty_when_predicate_absent() {
         let ttl = br#"
             @prefix foaf: <http://xmlns.com/foaf/0.1/> .
-            <https://pod.example/alice#me> foaf:name "Alice" .
+            <https://pod.example/alice/profile/card#me> foaf:name "Alice" .
         "#;
-        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice").unwrap();
+        let issuers = parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).unwrap();
         assert!(issuers.is_empty());
     }
 
@@ -353,6 +416,6 @@ mod tests {
     #[test]
     fn parse_oidc_issuers_rejects_malformed_turtle() {
         let ttl = b"this is not <turtle at all ;;;";
-        assert!(parse_oidc_issuers(ttl, "https://pod.example/alice").is_err());
+        assert!(parse_oidc_issuers(ttl, PROFILE, WEBID, PROFILE).is_err());
     }
 }
