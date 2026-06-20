@@ -76,22 +76,30 @@ explicitly, holding it to the same exhaustive-test bar as the TS source.
   token.
 - **No `unsafe`.** `#![forbid(unsafe_code)]`.
 
-## ⚠️ KNOWN NARROWING — ES512
+## ES512 — opt-in via the `es512` feature (default-off)
 
-`jsonwebtoken` (the M1 JWS primitive, on the `aws-lc-rs` backend) **cannot verify ES512** (P-521 /
-SHA-512). The resource server's policy allowlist (`SIGNING_ALGS`) *includes* ES512. Rather than
-silently accept an ES512 token we cannot actually verify — which would be an authentication bypass —
-this crate **rejects** any ES512 token/proof with a clear error (`map_algorithm` → an `invalid_token`
-naming the narrowing). **Never accept an alg you cannot verify.**
+`jsonwebtoken` (the primary JWS primitive, on the `aws-lc-rs` backend) **cannot verify ES512** (P-521
+/ SHA-512). The resource server's policy allowlist (`SIGNING_ALGS`) *includes* ES512. By **default**,
+rather than silently accept an ES512 token it cannot verify — which would be an authentication bypass
+— this crate **rejects** any ES512 token/proof with a clear error (the KNOWN NARROWING). **Never
+accept an alg you cannot verify.**
+
+Enabling the **default-off `es512` Cargo feature** lifts the narrowing: it adds a pure-Rust RustCrypto
+([`p521`](https://crates.io/crates/p521)) ECDSA / SHA-512 verification path that genuinely verifies
+ES512 on a *separate* backend from `jsonwebtoken`. It is alg-pinned (the ES512 fork is entered only
+after `alg == "ES512"` is established from the policy allowlist), curve-confusion-safe (only an
+EC / **P-521** key is ever built — a P-256/P-384 key is rejected), asymmetric-only, and fails closed
+on any decode/length/curve/signature-format error. The JWS signature is the fixed-width `r||s`
+(132 bytes); the two crypto backends never share key material.
+
+```toml
+# Cargo.toml — opt in (security-critical, maintainer-gated, hence default-off)
+solid-oidc-verifier = { version = "0.1", features = ["es512"] }
+```
 
 This is a documented, maintainer-gated decision (spike open-decision #4 / risk R6). Keycloak's default
-is RS256, so real-world impact is low. Two M2 resolutions are possible:
-
-1. accept the narrowing permanently and drop ES512 from the policy set; or
-2. add a `josekit`/OpenSSL-backed verification path for ES512.
-
-See `solid_oidc_verifier::jwk::ES512_KNOWN_NARROWING` and the `// KNOWN NARROWING` comment in
-`src/jwk.rs`.
+is RS256, so the real-world impact of the default narrowing is low. See
+`solid_oidc_verifier::jwk::ES512_KNOWN_NARROWING` and the `// KNOWN NARROWING` doc in `src/jwk.rs`.
 
 ## Usage
 
@@ -155,7 +163,7 @@ match verifier.verify(&req) {
 | JWKS provider (trait + static) | ✅ implemented + tested | `openidconnect` discovery + cached JWKS fetch (`JwksProvider`) |
 | WebID resolver (trait + fixture) + bidirectional check | ✅ implemented + tested | `reqwest`+`hickory-resolver` DNS-pinned fetch (`WebIdResolver`) |
 | ES256/384, PS256/384/512, RS256/384/512, EdDSA | ✅ | — |
-| ES512 | ❌ rejected (KNOWN NARROWING) | maintainer decision |
+| ES512 | ✅ via the default-off `es512` feature (`p521`); rejected (KNOWN NARROWING) when off | — |
 | axum shim + Solid CTH + Keycloak DPoP IT | — | M2 |
 
 The two network adapters are `trait`s (`config::JwksProvider`, `webid::WebIdResolver`) so the
@@ -168,7 +176,10 @@ install-time scripts — there is no blanket disable). `deny.toml` + `cargo-deny
 sources + licenses) govern that surface; CI runs it as an advisory lane in M1. Do **not** claim
 "supply-chain solved" — it is a lateral shift, governed, not eliminated. The RSA-crate Marvin timing
 side-channel (RUSTSEC-2023-0071) is dodged by verifying via the `aws-lc-rs` `jsonwebtoken` backend; the
-`rsa` crate is a dev-only dependency (test RS256 key generation), never in the verification path.
+`rsa` crate is a dev-only dependency (test RS256 key generation), never in the verification path. The
+default-off `es512` feature adds the pure-Rust RustCrypto `p521` crate
+(`github.com/RustCrypto/elliptic-curves`, the same ecosystem + major as the test-only `p256` dev-dep)
+as the only ES512 verification dependency.
 
 ## Development
 
@@ -179,12 +190,13 @@ cargo test
 cargo deny check          # advisory
 ```
 
-The test suite generates fresh ES256/RSA keys in-test and mints real tokens + proofs, then drives the
-full public API across the entire negative/attack space (forged signature, untrusted issuer,
-missing/non-https/userinfo WebID, expired/future token, HS256/none/ES512, DPoP htm/htu/iat/typ
-mismatch, replayed jti, cnf.jkt mismatch, embedded private key, Bearer-when-DPoP-required, the ath
-three-state, multi-issuer isolation, JWKS-failure→401, replay-fail-closed→503, and the SSRF
-classifier).
+The test suite generates fresh ES256/RSA keys in-test (and fresh P-521 keys under the `es512` feature)
+and mints real tokens + proofs, then drives the full public API across the entire negative/attack
+space (forged signature, untrusted issuer, missing/non-https/userinfo WebID, expired/future token,
+HS256/none, ES512 — rejected when the feature is off, verified + wrong-curve/forged/malformed-rejected
+when on — DPoP htm/htu/iat/typ mismatch, replayed jti, cnf.jkt mismatch, embedded private key,
+Bearer-when-DPoP-required, the ath three-state, multi-issuer isolation, JWKS-failure→401,
+replay-fail-closed→503, and the SSRF classifier). Run the ES512 path with `cargo test --features es512`.
 
 ## License
 

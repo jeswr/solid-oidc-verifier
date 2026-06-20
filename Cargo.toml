@@ -16,6 +16,11 @@ readme = "README.md"
 # (RUSTSEC-2023-0071). NOTE: jsonwebtoken cannot do ES512 — see the KNOWN NARROWING in README + lib.rs.
 jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
 sha2 = "0.10"
+# ES512 (ECDSA P-521 / SHA-512) verification — `jsonwebtoken`/aws-lc-rs cannot do ES512, so the
+# `es512` feature adds a pure-Rust RustCrypto verification path. DEFAULT-OFF: with the feature off the
+# crate keeps the KNOWN NARROWING (ES512 rejected, never silently accepted). Same RustCrypto
+# ecosystem + major as the test-only `p256 = "0.13"` dev-dep (github.com/RustCrypto/elliptic-curves).
+p521 = { version = "0.13.3", features = ["ecdsa"], optional = true }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -36,3 +41,6 @@ rand = "0.8"
 
 [features]
 default = []
+# Enable ES512 (ECDSA P-521 / SHA-512) JWS *verification* via the pure-Rust RustCrypto `p521` crate.
+# DEFAULT-OFF (security-critical, maintainer-gated). When off, ES512 stays unverifiable (rejected).
+es512 = ["dep:p521"]

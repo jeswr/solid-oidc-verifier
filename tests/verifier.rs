@@ -725,6 +725,11 @@ fn rejects_alg_none_access_token() {
     );
 }
 
+/// Feature OFF: an ES512 access token is rejected by the KNOWN NARROWING (never silently accepted).
+/// With the `es512` feature ON the narrowing is lifted and ES512 is genuinely verified, so this
+/// narrowing-specific assertion only applies feature-OFF — the ON behaviour is covered by the
+/// dedicated `es512` test module (happy-path + wrong-curve + forged-signature + malformed-coords).
+#[cfg(not(feature = "es512"))]
 #[test]
 fn rejects_es512_access_token_known_narrowing() {
     let issuer = KeyKit::generate();

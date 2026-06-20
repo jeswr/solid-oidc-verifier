@@ -37,12 +37,15 @@
 //!   failure in `strict` mode is a 401.
 //! - **Non-leaky errors.** Client-facing messages never disclose token bytes or SSRF/network detail.
 //!
-//! ## KNOWN NARROWING — ES512
-//! The `jsonwebtoken` primitive cannot verify **ES512** (P-521/SHA-512). PSS's policy allowlist
-//! includes ES512, so a token/proof using it is **explicitly rejected** rather than silently accepted
-//! (never accept an alg you cannot verify). This is a maintainer decision (spike open-decision #4):
-//! drop ES512 permanently, or add an OpenSSL/josekit ES512 path. Keycloak defaults to RS256, so the
-//! real-world impact is low. See [`jwk::ES512_KNOWN_NARROWING`].
+//! ## ES512 (feature `es512`, default-off)
+//! The `jsonwebtoken` primitive cannot verify **ES512** (P-521/SHA-512). By default this crate
+//! **explicitly rejects** an ES512 token/proof rather than silently accept an alg it cannot verify
+//! (the KNOWN NARROWING — never accept what you cannot verify). Enabling the default-off `es512`
+//! feature lifts the narrowing: it adds a pure-Rust RustCrypto (`p521`) ECDSA/SHA-512 verification
+//! path that genuinely verifies ES512 (still asymmetric-only, still alg-pinned, still
+//! curve-confusion-safe — only an EC/P-521 key is ever built for ES512). The feature is default-off
+//! because it is security-critical and maintainer-gated. Keycloak defaults to RS256, so the
+//! real-world impact of the default narrowing is low. See [`jwk::ES512_KNOWN_NARROWING`].
 //!
 //! ## What is M1 vs deferred (M2)
 //! M1 ships the full verification **core** + the security-critical logic, exhaustively tested with

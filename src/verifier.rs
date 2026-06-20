@@ -25,9 +25,10 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{JwksProvider, VerifierConfig, DPOP_PROOF_MAX_AGE_SECS};
 use crate::error::{invalid_request, invalid_token, invalid_token_dpop, ErrorKind, VerifyError};
+use crate::jwk::{alg_in_policy, alg_is_verifiable};
 use crate::jwt::{
-    map_algorithm, peek_claims, peek_header, peek_issuer, proof_has_ath,
-    verify_proof_with_embedded_jwk, verify_signature, Claims,
+    peek_claims, peek_header, peek_issuer, proof_has_ath, verify_proof_with_embedded_jwk,
+    verify_signature, Claims,
 };
 use crate::replay::{MarkResult, ReplayStore};
 use crate::webid::{
@@ -227,9 +228,22 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         parsed: &Parsed,
         claimed_issuer: &str,
     ) -> Result<Claims, VerifyError> {
-        // Reject an unverifiable alg (incl. the ES512 narrowing) up-front with a clear message.
+        // Reject a non-policy or unverifiable alg up-front with a clear message. This uses the
+        // feature-aware acceptability check (`alg_in_policy` + `alg_is_verifiable`) rather than
+        // `map_algorithm` so that with the `es512` feature ON an ES512 access token is NOT wrongly
+        // rejected here — its actual verification is delegated to `verify_signature`, which forks the
+        // ES512 (p521) path. With the feature OFF, `alg_is_verifiable("ES512")` is false, so ES512 is
+        // still rejected up-front (the KNOWN NARROWING).
         let header = peek_header(&parsed.token)?;
-        map_algorithm(&header.alg)?;
+        if !alg_in_policy(&header.alg) {
+            return Err(invalid_token(format!(
+                "Unsupported or non-asymmetric signature algorithm: {}.",
+                header.alg
+            )));
+        }
+        if !alg_is_verifiable(&header.alg) {
+            return Err(invalid_token(crate::jwk::ES512_KNOWN_NARROWING));
+        }
 
         let keys = self
             .jwks

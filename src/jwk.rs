@@ -24,27 +24,46 @@ pub const SIGNING_ALGS: &[&str] = &[
 /// The algs advertised in the `WWW-Authenticate` `algs=` parameter (RFC 9449 §5.1). Same set.
 pub const DPOP_ALGS: &[&str] = SIGNING_ALGS;
 
-/// # KNOWN NARROWING — ES512
+/// # KNOWN NARROWING — ES512 (feature `es512` OFF)
 ///
-/// `jsonwebtoken` (the M1 JWS primitive, on the `aws_lc_rs` backend) does NOT implement **ES512**
-/// (P-521 / SHA-512). PSS's `SIGNING_ALGS` *policy* allowlist includes ES512, so a strict port would
-/// have to verify it. Rather than silently accept an ES512 token we cannot actually verify (which
-/// would be an auth bypass), this crate **rejects** any ES512 token/proof with a clear error.
+/// `jsonwebtoken` (the primary JWS primitive, on the `aws_lc_rs` backend) does NOT implement
+/// **ES512** (P-521 / SHA-512). PSS's `SIGNING_ALGS` *policy* allowlist includes ES512, so a strict
+/// port would have to verify it. With the `es512` feature OFF, rather than silently accept an ES512
+/// token we cannot actually verify (which would be an auth bypass), this crate **rejects** any ES512
+/// token/proof with a clear error.
+///
+/// This narrowing is **lifted** when the default-off `es512` feature is enabled: that adds a
+/// pure-Rust RustCrypto (`p521`) ECDSA/SHA-512 verification path so ES512 is genuinely verified, not
+/// rejected. See [`alg_is_verifiable`] and `jwt::verify_es512_over_candidates`.
 ///
 /// This is a documented, maintainer-gated narrowing (spike open-decision #4 / risk R6). Keycloak's
-/// default is RS256, so real-world impact is low. Two M2 resolutions are possible: (a) accept the
-/// narrowing permanently and drop ES512 from the policy set, or (b) add a josekit/OpenSSL-backed
-/// verification path for ES512. Until then: **never accept an alg we cannot verify.**
+/// default is RS256, so real-world impact is low. Until the feature is enabled: **never accept an alg
+/// we cannot verify.**
+///
+/// NB: kept compiled in BOTH feature configurations (the message is still the rejection text used by
+/// `map_algorithm` for any caller that reaches it with ES512 while the feature is off, and the
+/// feature-OFF narrowing tests assert on it).
 pub const ES512_KNOWN_NARROWING: &str =
-    "ES512 is in the policy allowlist but unverifiable by the jsonwebtoken primitive; rejected (see KNOWN NARROWING).";
+    "ES512 is in the policy allowlist but unverifiable without the `es512` feature; rejected (see KNOWN NARROWING).";
 
-/// Whether `alg` is BOTH in the policy allowlist AND actually verifiable by this crate's primitive.
-/// ES512 fails this (policy yes, verifiable no) — the narrowing.
+/// Whether `alg` is BOTH in the policy allowlist AND actually verifiable by this crate's primitives.
+///
+/// Without the `es512` feature, ES512 fails this (policy yes, verifiable no) — the KNOWN NARROWING.
+/// With the `es512` feature enabled, the pure-Rust `p521` path makes ES512 verifiable, so it is
+/// included here (and the narrowing is lifted).
 pub fn alg_is_verifiable(alg: &str) -> bool {
-    matches!(
+    if matches!(
         alg,
         "ES256" | "ES384" | "PS256" | "PS384" | "PS512" | "RS256" | "RS384" | "RS512" | "EdDSA"
-    )
+    ) {
+        return true;
+    }
+    #[cfg(feature = "es512")]
+    if alg == "ES512" {
+        // The `es512` feature adds a RustCrypto P-521 verification path — ES512 is now verifiable.
+        return true;
+    }
+    false
 }
 
 /// Whether `alg` is in the asymmetric-only policy allowlist (incl. the not-yet-verifiable ES512).
@@ -249,10 +268,20 @@ mod tests {
         assert!(jwk.has_private_material());
     }
 
+    /// Feature OFF: ES512 is in the policy allowlist but NOT verifiable — the KNOWN NARROWING.
+    #[cfg(not(feature = "es512"))]
     #[test]
     fn es512_is_policy_but_not_verifiable() {
         assert!(alg_in_policy("ES512"));
         assert!(!alg_is_verifiable("ES512"));
+    }
+
+    /// Feature ON: ES512 is in the policy allowlist AND verifiable (the narrowing is lifted).
+    #[cfg(feature = "es512")]
+    #[test]
+    fn es512_is_policy_and_verifiable_with_feature() {
+        assert!(alg_in_policy("ES512"));
+        assert!(alg_is_verifiable("ES512"));
     }
 
     #[test]

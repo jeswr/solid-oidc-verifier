@@ -282,3 +282,98 @@ impl RsaKeyKit {
         self.sign(&header, &claims)
     }
 }
+
+// --- ES512 (ECDSA P-521 / SHA-512) support — exercises the `es512` feature's pure-Rust verify path.
+// Gated to the feature so the `p521` crate is only referenced when the feature (and its dependency)
+// is enabled.
+
+/// A P-521 key pair + its public JWK (`crv=P-521`, 66-byte `x`/`y`) + the RFC 7638 thumbprint,
+/// signing ES512 (the JWS signature is fixed-width `r||s` = 132 bytes, SHA-512 digest).
+#[cfg(feature = "es512")]
+pub struct P521KeyKit {
+    pub signing: p521::ecdsa::SigningKey,
+    pub public_jwk: Value,
+    pub thumbprint: String,
+}
+
+#[cfg(feature = "es512")]
+impl P521KeyKit {
+    pub fn generate() -> Self {
+        let signing = p521::ecdsa::SigningKey::random(&mut OsRng);
+        let verifying = p521::ecdsa::VerifyingKey::from(&signing);
+        let point = verifying.to_encoded_point(false);
+        // P-521 coordinates are 66 bytes each.
+        let x = b64url(point.x().expect("x coordinate"));
+        let y = b64url(point.y().expect("y coordinate"));
+        let public_jwk = json!({ "kty": "EC", "crv": "P-521", "x": x, "y": y });
+        let canonical = format!(r#"{{"crv":"P-521","kty":"EC","x":"{x}","y":"{y}"}}"#);
+        let thumbprint = b64url(&Sha256::digest(canonical.as_bytes()));
+        Self {
+            signing,
+            public_jwk,
+            thumbprint,
+        }
+    }
+
+    pub fn jwk(&self) -> Jwk {
+        serde_json::from_value(self.public_jwk.clone()).unwrap()
+    }
+
+    /// Sign a compact JWS with this key (ES512): fixed-width `r||s` (P1363), SHA-512 digest.
+    pub fn sign(&self, header: &Value, claims: &Value) -> String {
+        use p521::ecdsa::signature::Signer as _;
+        let signing_input = format!("{}.{}", b64url_json(header), b64url_json(claims));
+        let sig: p521::ecdsa::Signature = self.signing.sign(signing_input.as_bytes());
+        // `to_bytes()` is the fixed-width r||s encoding (132 bytes for P-521), exactly what JWS uses.
+        format!("{signing_input}.{}", b64url(&sig.to_bytes()))
+    }
+}
+
+/// Mint an ES512 RFC-9068 access token signed by `issuer_key` (P-521). Same shape as
+/// [`mint_access_token`] but with `alg=ES512` and a P-521 signature.
+#[cfg(feature = "es512")]
+pub fn mint_es512_access_token(issuer_key: &P521KeyKit, cnf_jkt: Option<&str>) -> String {
+    let header = json!({ "alg": "ES512", "typ": "at+jwt" });
+    let iat = now();
+    let mut claims = Map::new();
+    claims.insert("iss".into(), json!(ISSUER));
+    claims.insert("sub".into(), json!(WEBID));
+    claims.insert("jti".into(), json!(format!("at-{}", next_id())));
+    claims.insert("client_id".into(), json!(CLIENT_ID));
+    claims.insert("aud".into(), json!(AUDIENCE));
+    claims.insert("webid".into(), json!(WEBID));
+    if let Some(jkt) = cnf_jkt {
+        claims.insert("cnf".into(), json!({ "jkt": jkt }));
+    }
+    claims.insert("iat".into(), json!(iat));
+    claims.insert("exp".into(), json!(iat + 300));
+    issuer_key.sign(&header, &Value::Object(claims))
+}
+
+/// Mint an ES512 DPoP proof signed by `client_key` (P-521), embedding its public P-521 JWK.
+#[cfg(feature = "es512")]
+pub fn mint_es512_dpop_proof(
+    client_key: &P521KeyKit,
+    method: &str,
+    url: &str,
+    access_token: &str,
+) -> String {
+    let header = json!({ "alg": "ES512", "typ": "dpop+jwt", "jwk": client_key.public_jwk.clone() });
+    let mut claims = Map::new();
+    claims.insert("htm".into(), json!(method));
+    claims.insert("htu".into(), json!(url));
+    claims.insert("jti".into(), json!(format!("jti-{}", next_id())));
+    claims.insert("iat".into(), json!(now()));
+    claims.insert("ath".into(), json!(ath(access_token)));
+    client_key.sign(&header, &Value::Object(claims))
+}
+
+/// A static JWKS provider over one issuer's P-521 key.
+#[cfg(feature = "es512")]
+pub fn es512_jwks_provider(
+    issuer: &str,
+    key: &P521KeyKit,
+) -> solid_oidc_verifier::config::StaticJwksProvider {
+    solid_oidc_verifier::config::StaticJwksProvider::new()
+        .with_issuer(issuer.to_string(), vec![key.jwk()])
+}

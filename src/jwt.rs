@@ -98,7 +98,13 @@ pub fn proof_has_ath(proof: &str) -> bool {
 }
 
 /// Map an alg string to `jsonwebtoken`'s `Algorithm`, refusing anything outside the asymmetric-only
-/// policy allowlist AND anything the primitive cannot actually verify (the ES512 KNOWN NARROWING).
+/// policy allowlist AND anything `jsonwebtoken` cannot verify.
+///
+/// ES512 is ALWAYS rejected here as defence-in-depth: `Algorithm::ES512` does not exist on the
+/// `aws_lc_rs` backend, so even when the `es512` feature is enabled the ES512 token is verified on a
+/// SEPARATE pure-Rust path ([`verify_es512_over_candidates`]) that is forked BEFORE this function in
+/// [`verify_signature`]. Any caller that nonetheless reaches `map_algorithm` with ES512 gets a clear
+/// error rather than a silent fall-through — the two backends never share a code path.
 pub fn map_algorithm(alg: &str) -> Result<Algorithm, VerifyError> {
     if !alg_in_policy(alg) {
         // HS*, none, or any unknown alg → rejected. This is the alg-confusion / symmetric guard.
@@ -106,8 +112,13 @@ pub fn map_algorithm(alg: &str) -> Result<Algorithm, VerifyError> {
             "Unsupported or non-asymmetric signature algorithm: {alg}."
         )));
     }
+    if alg == "ES512" {
+        // Explicit rejection arm (defence-in-depth). `jsonwebtoken`/aws-lc-rs has no ES512 variant;
+        // ES512 is handled on the p521 fork BEFORE this point (feature on) or rejected (feature off).
+        return Err(invalid_token(ES512_KNOWN_NARROWING));
+    }
     if !alg_is_verifiable(alg) {
-        // ES512: in policy, but unverifiable by this primitive. NEVER accept what we cannot verify.
+        // In policy, but unverifiable by this primitive. NEVER accept what we cannot verify.
         return Err(invalid_token(ES512_KNOWN_NARROWING));
     }
     Ok(match alg {
@@ -127,6 +138,23 @@ pub fn map_algorithm(alg: &str) -> Result<Algorithm, VerifyError> {
             )))
         }
     })
+}
+
+/// Enforce the optional `expected_typ` against a header's `typ` (case-insensitive, RFC-9068/9449).
+/// Factored out so the `jsonwebtoken` fork and the ES512 (`p521`) fork enforce `typ` IDENTICALLY —
+/// the ES512 path must apply the `at+jwt` / `dpop+jwt` check exactly as the primary path does.
+fn enforce_typ(header: &Header, expected_typ: Option<&str>) -> Result<(), VerifyError> {
+    if let Some(want) = expected_typ {
+        match header.typ.as_deref() {
+            Some(got) if got.eq_ignore_ascii_case(want) => {}
+            _ => {
+                return Err(invalid_token(format!(
+                    "Unexpected token typ (want {want})."
+                )))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Build a `jsonwebtoken::DecodingKey` from a JWK. Supports the asymmetric key types Solid uses.
@@ -197,18 +225,25 @@ pub fn verify_signature(
     expected_typ: Option<&str>,
 ) -> Result<Claims, VerifyError> {
     let header = peek_header(token)?;
+
+    // ES512 fork — entered ONLY after `alg == "ES512"` is established (the alg is pinned from the
+    // header, never read as a trust input). `jsonwebtoken`/aws-lc-rs has no ES512, so ES512 is
+    // verified on a SEPARATE pure-Rust (`p521`) path; the two backends never share key material. The
+    // `typ` check is applied here IDENTICALLY to the primary path (via `enforce_typ`). With the
+    // `es512` feature OFF this branch does not exist, so `map_algorithm` below rejects ES512 (the
+    // KNOWN NARROWING is preserved).
+    #[cfg(feature = "es512")]
+    if header.alg == "ES512" {
+        enforce_typ(&header, expected_typ)?;
+        return verify_es512_over_candidates(token, candidate_keys);
+    }
+
+    // An RS256/ES256/… token must NEVER reach the p521 path (guarded by the `== "ES512"` check above),
+    // and an ES512 token must NEVER reach `jsonwebtoken` (rejected by the explicit arm in
+    // `map_algorithm`). The two crypto backends are isolated by alg.
     let alg = map_algorithm(&header.alg)?;
 
-    if let Some(want) = expected_typ {
-        match header.typ.as_deref() {
-            Some(got) if got.eq_ignore_ascii_case(want) => {}
-            _ => {
-                return Err(invalid_token(format!(
-                    "Unexpected token typ (want {want})."
-                )))
-            }
-        }
-    }
+    enforce_typ(&header, expected_typ)?;
 
     // We deliberately disable jsonwebtoken's built-in claim validation here (no iss/aud/exp) — we run
     // those ourselves to match the TS semantics precisely (clock tolerance, required claims, etc.).
@@ -266,6 +301,123 @@ pub fn verify_proof_with_embedded_jwk(
     }
     let claims = verify_signature(proof, std::slice::from_ref(&jwk), Some(expected_typ))?;
     Ok((claims, jwk))
+}
+
+/// P-521 coordinate length in bytes (⌈521/8⌉ = 66). Both `x` and `y` MUST be exactly this many bytes,
+/// and the fixed-width JWS signature is `r || s` = 2×66 = 132 bytes.
+#[cfg(feature = "es512")]
+const P521_COORD_LEN: usize = 66;
+
+/// Build a `p521::ecdsa::VerifyingKey` from an EC/P-521 public JWK, failing CLOSED on ANY
+/// decode/length/curve error. The guards mirror [`decoding_key_from_jwk`] exactly (reject symmetric +
+/// private material FIRST), then REQUIRE `kty == "EC"` AND `crv == Some("P-521")` so a P-256/P-384 key
+/// can NEVER be accepted for ES512 (curve-confusion guard), then build the key from the SEC1
+/// uncompressed point `0x04 || x || y` with each coordinate validated to be exactly 66 bytes.
+#[cfg(feature = "es512")]
+fn p521_verifying_key_from_jwk(jwk: &Jwk) -> Result<p521::ecdsa::VerifyingKey, VerifyError> {
+    // (1) Identical guards to `decoding_key_from_jwk`: never verify with a symmetric or private key.
+    if jwk.is_symmetric() {
+        return Err(invalid_token("Symmetric keys are not accepted."));
+    }
+    if jwk.has_private_material() {
+        return Err(invalid_token(
+            "Key contains private material; only a public key is accepted.",
+        ));
+    }
+    // (2) Require EC / P-521 — NEVER accept a P-256/P-384 (or any other) key for ES512.
+    if !jwk.kty.eq_ignore_ascii_case("EC") {
+        return Err(invalid_token("ES512 requires an EC key."));
+    }
+    match jwk.crv.as_deref() {
+        Some("P-521") => {}
+        _ => return Err(invalid_token("ES512 requires an EC key on curve P-521.")),
+    }
+    // (3) base64url-decode x and y (URL_SAFE_NO_PAD).
+    let x = jwk
+        .x
+        .as_deref()
+        .ok_or_else(|| invalid_token("EC JWK missing x."))?;
+    let y = jwk
+        .y
+        .as_deref()
+        .ok_or_else(|| invalid_token("EC JWK missing y."))?;
+    let x = b64url_decode(x).ok_or_else(|| invalid_token("EC JWK x is not valid base64url."))?;
+    let y = b64url_decode(y).ok_or_else(|| invalid_token("EC JWK y is not valid base64url."))?;
+    // (4) Each coordinate MUST be exactly 66 bytes (the P-521 field size). A short/long coordinate is
+    //     rejected, never zero-padded — an off-length coordinate is not a valid P-521 point.
+    if x.len() != P521_COORD_LEN || y.len() != P521_COORD_LEN {
+        return Err(invalid_token(
+            "ES512 EC coordinate is not the expected 66-byte P-521 length.",
+        ));
+    }
+    // (5) SEC1 uncompressed point: 0x04 || x || y. `from_sec1_bytes` validates the point is on-curve
+    //     (and not the identity), so a crafted off-curve point fails closed here.
+    let mut sec1 = Vec::with_capacity(1 + 2 * P521_COORD_LEN);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    p521::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+        .map_err(|_| invalid_token("Invalid P-521 public key."))
+}
+
+/// Verify an ES512 (ECDSA P-521 / SHA-512) compact JWS against candidate EC/P-521 JWKS keys.
+///
+/// The signing input is the ASCII `header.payload` (the first two compact segments). The JWS
+/// signature is the fixed-width `r || s` (132 bytes for P-521) — P1363, NOT DER — so it is parsed with
+/// `Signature::from_slice`. Verification uses the `ecdsa` `Verifier` trait, whose P-521 impl digests
+/// the message with SHA-512 (exactly ES512). The first candidate key that verifies wins; if none do,
+/// fail closed with `invalid_token`. Fails closed on ANY decode/length/format error — never panics.
+#[cfg(feature = "es512")]
+fn verify_es512_over_candidates(
+    token: &str,
+    candidate_keys: &[Jwk],
+) -> Result<Claims, VerifyError> {
+    use p521::ecdsa::signature::Verifier as _;
+
+    if candidate_keys.is_empty() {
+        return Err(invalid_token("No verification key available for issuer."));
+    }
+
+    let (h, p, s) = split_compact(token)?;
+    // The signing input is the EXACT ASCII bytes `header.payload` (NOT re-encoded JSON).
+    let signing_input = format!("{h}.{p}");
+    let sig_bytes =
+        b64url_decode(s).ok_or_else(|| invalid_token("ES512 signature is not valid base64url."))?;
+    // Fixed-width r||s = 2 × 66 = 132 bytes. A wrong-length signature is rejected, not coerced.
+    if sig_bytes.len() != 2 * P521_COORD_LEN {
+        return Err(invalid_token(
+            "ES512 signature is not the expected 132-byte (r||s) length.",
+        ));
+    }
+    let signature = p521::ecdsa::Signature::from_slice(&sig_bytes)
+        .map_err(|_| invalid_token("ES512 signature is malformed."))?;
+
+    // Decode the verified claims ONLY after a key verifies (matching the jsonwebtoken path: signature
+    // first, then the claims object). We parse the payload up-front but return it only on success.
+    let claims_value: Value =
+        peek_claims(token).ok_or_else(|| invalid_token("Malformed token payload."))?;
+    let claims_map = match claims_value {
+        Value::Object(m) => m,
+        _ => return Err(invalid_token("Malformed token payload.")),
+    };
+
+    let mut last_err: Option<VerifyError> = None;
+    for jwk in candidate_keys {
+        let key = match p521_verifying_key_from_jwk(jwk) {
+            Ok(k) => k,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        match key.verify(signing_input.as_bytes(), &signature) {
+            Ok(()) => return Ok(claims_map),
+            Err(_) => {
+                last_err = Some(invalid_token("signature verification failed"));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| invalid_token("signature verification failed")))
 }
 
 #[cfg(test)]
