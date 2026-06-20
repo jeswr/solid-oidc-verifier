@@ -1543,22 +1543,25 @@ fn jwks_resolution_failure_message_is_constant_and_non_leaky() {
     assert_eq!(err.status(), 401);
     // The message is EXACTLY the constant — not the leaky detail interpolated into it.
     assert_eq!(err.message(), "Access token verification failed.");
-    // And it contains none of the sensitive tokens (host, private IP, URL, status).
-    for needle in [
+    // The full set of sensitive tokens (host, private IP, URL path, upstream status, whole detail).
+    let leak_needles = [
         "10.0.0.7",
         "idp.internal",
         ".well-known",
         "503",
         LEAKY_JWKS_DETAIL,
-    ] {
+    ];
+    // Neither the client message NOR the WWW-Authenticate challenge (which embeds the description) may
+    // contain ANY of them — checked with the IDENTICAL needle list (roborev round-3 Low: the challenge
+    // check previously omitted "503"/the full detail).
+    for needle in leak_needles {
         assert!(
             !err.message().contains(needle),
             "client message leaked internal detail: {needle:?}"
         );
     }
-    // The WWW-Authenticate challenge (which embeds the description) must also be clean.
     let challenge = v.www_authenticate(&err);
-    for needle in ["10.0.0.7", "idp.internal", ".well-known"] {
+    for needle in leak_needles {
         assert!(
             !challenge.contains(needle),
             "WWW-Authenticate leaked internal detail: {needle:?}"
