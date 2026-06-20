@@ -1,0 +1,23 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "solid-oidc-verifier",
+  "kind": "sdk",
+  "name": "Solid-OIDC Verifier (Rust)",
+  "repo": "https://github.com/jeswr/solid-oidc-verifier",
+  "category": "infrastructure",
+  "maturity": "prototype",
+  "visibility": "public",
+  "stack": {
+    "lang": "Rust (edition 2021)",
+    "crypto": "jsonwebtoken (aws-lc-rs backend)",
+    "test": "cargo test",
+    "lint": "clippy -D warnings + rustfmt --check",
+    "supplyChain": "cargo-deny (deny.toml)"
+  },
+  "dependsOn": ["prod-solid-server"],
+  "roadmap": {
+    "doc": "https://github.com/jeswr/solid-oidc-verifier#readme",
+    "milestone": "M1 — standalone DPoP-bound Solid-OIDC resource-server verifier (Rust-migration carve-out #2)",
+    "note": "A behavioural Rust port of prod-solid-server's vetted TS verifier (src/auth) — the single load-bearing security blocker of the Rust-migration spike (risk R1). Verifies RFC 9068 at+jwt access tokens + RFC 9449 DPoP proofs, asymmetric-algorithms-only, issuer-agnostic (trusted-issuer allowlist), with the three-state allow_missing_ath compat, a fail-closed pluggable jti replay store, RFC 7638 cnf.jkt proof-of-possession, and a DNS-pinned SSRF-safe WebID-resolver seam (the IP classifier + URL gate are implemented + tested in M1; the network fetch adapter is M2). KNOWN NARROWING: ES512 is rejected (jsonwebtoken cannot verify it) rather than silently accepted — a maintainer decision (spike open-decision #4). M2: the openidconnect JWKS-discovery adapter, the reqwest+hickory DNS-pinning WebID fetch, an axum shim, the 41/41 ath-patched Solid CTH run, the full 251-case auth port, and the Keycloak DPoP integration test. crates.io publish deferred — consume via git for now."
+  }
+}

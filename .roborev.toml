@@ -1,0 +1,10 @@
+# roborev post-commit review config — matches the solid-app-suite standard.
+# Security-critical crate: every commit is reviewed by a non-Anthropic model (codex).
+
+agent = "codex"
+model = "gpt-5.5"
+
+review_min_severity = "low"
+
+reuse_review_session = true
+reuse_review_session_lookback = 5

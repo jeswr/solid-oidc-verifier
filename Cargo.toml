@@ -1,0 +1,37 @@
+[package]
+name = "solid-oidc-verifier"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+description = "Standalone DPoP-bound Solid-OIDC resource-server access-token verifier (RFC 6750/9068/9449). Issuer-agnostic, asymmetric-only, with a DNS-pinned SSRF-safe WebID resolver."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/jeswr/solid-oidc-verifier"
+homepage = "https://github.com/jeswr/solid-oidc-verifier"
+keywords = ["solid", "oidc", "dpop", "jwt", "authentication"]
+categories = ["authentication", "web-programming"]
+readme = "README.md"
+
+[dependencies]
+# JWS/JWT primitive. aws_lc_rs backend = vetted C crypto, avoids the rsa-crate Marvin attack
+# (RUSTSEC-2023-0071). NOTE: jsonwebtoken cannot do ES512 — see the KNOWN NARROWING in README + lib.rs.
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem", "aws_lc_rs"] }
+sha2 = "0.10"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+url = "2"
+# jti replay store: in-memory TTL cache.
+moka = { version = "0.12", features = ["sync"] }
+
+[dev-dependencies]
+# Test-only key generation + JWS minting (mirrors the TS `jose` test helpers).
+p256 = { version = "0.13", features = ["ecdsa", "jwk", "pem", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+# RSA key generation + RS256 signing so the test suite proves the Keycloak-default RS256 path
+# (the case the rejected `dpop-verifier` crate could not handle — spike R1).
+rsa = { version = "0.9", features = ["sha2"] }
+rand = "0.8"
+
+[features]
+default = []
