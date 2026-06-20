@@ -47,14 +47,23 @@
 //! because it is security-critical and maintainer-gated. Keycloak defaults to RS256, so the
 //! real-world impact of the default narrowing is low. See [`jwk::ES512_KNOWN_NARROWING`].
 //!
-//! ## What is M1 vs deferred (M2)
-//! M1 ships the full verification **core** + the security-critical logic, exhaustively tested with
-//! deterministic in-test keys and a static JWKS provider. The **network adapters** are seams:
-//! [`config::JwksProvider`] (OIDC discovery + JWKS fetch via `openidconnect`) and
-//! [`webid::WebIdResolver`] (the DNS-pinned, redirect-revalidating, body-bounded `reqwest`+
-//! `hickory-resolver` fetch). The SSRF address classifier ([`ssrf`]) and the URL gate
-//! ([`webid::ssrf_gate_static`]) — the load-bearing parts of the resolver — are implemented and tested
-//! in M1; only the network plumbing around them is M2.
+//! ## M1 (core) + M2 (network adapters) — both shipped
+//! **M1** ships the full verification **core** + the security-critical logic, exhaustively tested with
+//! deterministic in-test keys and a static JWKS provider. **M2** (the `network` feature, on by default)
+//! wires the network adapters behind the M1 trait seams, all through ONE DNS-pinned, SSRF-guarded fetch
+//! primitive ([`net::SafeFetcher`] — resolve → classify EVERY record → pin to the validated IP → no
+//! auto-redirect / re-gate each hop → bounded body + timeout):
+//! - [`config::NetworkJwksProvider`] — OIDC discovery (`<issuer>/.well-known/openid-configuration`) →
+//!   `jwks_uri` → JWKS fetch + parse, cached, with the RFC 8414 issuer-match check. A `jwks_uri` at a
+//!   private host (or one reached via a 302 to one) fails closed.
+//! - [`webid::NetworkWebIdResolver`] — the DNS-pinned, redirect-revalidating, body-bounded profile
+//!   fetch + `oxttl` Turtle parse, returning the `solid:oidcIssuer` set.
+//! - [`net`] — the shared `SafeFetcher` (reqwest + hickory-resolver). The SSRF address classifier
+//!   ([`ssrf`]) and the URL gate ([`webid::ssrf_gate_static`]) are the M1 logic it composes.
+//!
+//! A consumer wanting only the pure core (no async/HTTP deps) builds with `default-features = false`.
+//! The axum CTH shim (`examples/cth_shim.rs`) and the `#[ignore]`'d Keycloak DPoP integration test
+//! (`tests/keycloak_it.rs`, gated on `PSS_IT_KEYCLOAK=1`) complete the M2 slice.
 //!
 //! ## Usage
 //! ```no_run
@@ -92,16 +101,24 @@ pub mod config;
 pub mod error;
 pub mod jwk;
 pub mod jwt;
+#[cfg(feature = "network")]
+pub mod net;
 pub mod replay;
 pub mod ssrf;
 pub mod verifier;
 pub mod webid;
 
 // Convenience re-exports of the public API surface.
+#[cfg(feature = "network")]
+pub use config::NetworkJwksProvider;
 pub use config::{ConfigError, JwksError, JwksProvider, StaticJwksProvider, VerifierConfig};
 pub use error::{ErrorKind, VerifyError};
 pub use jwk::{Jwk, JwkError, ES512_KNOWN_NARROWING, SIGNING_ALGS};
+#[cfg(feature = "network")]
+pub use net::{HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher, SystemResolver};
 pub use replay::{InMemoryReplayStore, MarkResult, ReplayBackendError, ReplayStore};
 pub use ssrf::{is_loopback_address, is_public_address};
 pub use verifier::{AuthRequest, VerifiedToken, Verifier};
+#[cfg(feature = "network")]
+pub use webid::NetworkWebIdResolver;
 pub use webid::{BidirectionalMode, WebIdProfile, WebIdProfileError, WebIdResolver};

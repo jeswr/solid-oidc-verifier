@@ -28,7 +28,24 @@ thiserror = "2"
 url = "2"
 # Note: the in-memory jti replay store uses only std (Mutex<HashMap>) so it can fail CLOSED at
 # capacity and offer an atomic check-and-set — see src/replay.rs. A shared (Redis SET NX) store is
-# the M2 `ReplayStore` impl.
+# a future `ReplayStore` impl.
+
+# --- M2 network adapters (the `network` feature, ON by default) -------------------------------------
+# The DNS-pinned, SSRF-guarded HTTP path behind the `JwksProvider` (OIDC discovery + JWKS fetch) and
+# `WebIdResolver` (profile fetch) trait seams. Recommended crates per the Rust-migration spike §4.
+# `reqwest` pins NO DNS by default, so we install a custom `dns::Resolve` (backed by `hickory-resolver`)
+# that runs EVERY resolved record through the M1 `ssrf` classifier (DNS-rebinding mitigation) and pins
+# the connection to a validated IP — the load-bearing security plumbing.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }
+hickory-resolver = { version = "0.24", optional = true }
+# WebID profile RDF parsing. oxttl is the W3C-rdf-tests-driven Turtle/N-Triples parser (the N3.js
+# replacement per the Rust-migration spike §4) — we parse profiles via it rather than hand-rolling an
+# RDF parser (the suite "never hand-build/parse triples" rule). Only the `solid:oidcIssuer` objects are
+# extracted; we use the streaming parser so a hostile profile cannot be parsed unbounded.
+oxttl = { version = "0.1", optional = true }
+# oxttl yields `oxrdf` terms; we read `Term::NamedNode` objects of the `solid:oidcIssuer` predicate.
+oxrdf = { version = "0.2", optional = true }
 
 [dev-dependencies]
 # Test-only key generation + JWS minting (mirrors the TS `jose` test helpers).
@@ -38,9 +55,26 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # (the case the rejected `dpop-verifier` crate could not handle — spike R1).
 rsa = { version = "0.9", features = ["sha2"] }
 rand = "0.8"
+# The axum CTH shim example (a reference resource server) + its async runtime. Dev-only: the library
+# itself never depends on axum — the shim is an EXAMPLE so a consumer is free to wire any framework.
+axum = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 
 [features]
-default = []
+# `network` is ON by default: it is the M2 deliverable (the DNS-pinned SSRF-guarded JwksProvider +
+# WebIdResolver adapters + the axum CTH shim). A consumer that wants ONLY the pure verification core
+# (M1 — no async/HTTP deps) can opt out with `default-features = false`.
+default = ["network"]
 # Enable ES512 (ECDSA P-521 / SHA-512) JWS *verification* via the pure-Rust RustCrypto `p521` crate.
 # DEFAULT-OFF (security-critical, maintainer-gated). When off, ES512 stays unverifiable (rejected).
 es512 = ["dep:p521"]
+# The M2 network adapters: OIDC discovery + JWKS fetch + WebID-profile fetch, each through the
+# DNS-pinned, SSRF-guarded `SafeFetcher` (reqwest + hickory-resolver). Pulls the async/HTTP stack.
+network = ["dep:tokio", "dep:reqwest", "dep:hickory-resolver", "dep:oxttl", "dep:oxrdf"]
+
+# The axum Conformance-Test-Harness shim — a reference resource server that wires `Verifier` into an
+# HTTP endpoint so the Solid CTH auth suite can run against it. Requires `network` (+ the axum
+# dev-dep). Built by `cargo build --examples` / `cargo clippy --all-targets` when `network` is on.
+[[example]]
+name = "cth_shim"
+required-features = ["network"]

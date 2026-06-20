@@ -16,11 +16,16 @@ which identified the DPoP/Solid-OIDC verifier as **the single load-bearing secur
 Rust rewrite (risk R1). If this crate clears the auth bar, the rest of a rewrite is comparatively
 ordinary porting; if it cannot, the rewrite is do-not-proceed.
 
-> Status: **M1 complete; M2 in progress** (experimental). M1 = the verification core + all
-> security-critical logic, exhaustively tested. M2 = the network adapters (OIDC discovery/JWKS fetch,
-> the DNS-pinning WebID fetch) behind the existing clean trait seams, the ath-patched Solid CTH shim,
-> and the Keycloak DPoP integration test. License: dual `MIT OR Apache-2.0`. **crates.io publish is
-> deferred — consume via git.**
+> Status: **M1 + M2 complete** (experimental). M1 = the verification core + all security-critical
+> logic, exhaustively tested. M2 = the network adapters behind the existing clean trait seams — all
+> through one DNS-pinned, SSRF-guarded fetch primitive (`net::SafeFetcher`): the
+> `NetworkJwksProvider` (OIDC discovery + JWKS fetch, cached, RFC-8414 issuer-checked) and the
+> `NetworkWebIdResolver` (DNS-pinned, redirect-revalidating, body-bounded profile fetch + Turtle
+> parse) — plus the axum CTH shim (`examples/cth_shim.rs`) and the `#[ignore]`'d Keycloak DPoP
+> integration test (`tests/keycloak_it.rs`; running it needs a live Keycloak — `PSS_IT_KEYCLOAK=1`,
+> a `needs:user` item). The `network` feature is **on by default**; build with
+> `default-features = false` for the pure M1 core (no async/HTTP deps). License: dual
+> `MIT OR Apache-2.0`. **crates.io publish is deferred — consume via git.**
 
 ## Why
 

@@ -4,9 +4,10 @@
 //! Ports the security-relevant *logic* of `src/auth/webidResolver.ts`: the WebID claim shape checks
 //! (https-only, no userinfo), profile-URL canonicalisation (strip fragment + userinfo), and the
 //! per-URL SSRF gate (scheme allowlist, userinfo refusal, IP-literal classification via
-//! [`crate::ssrf`]). The actual network fetch + DNS-pinning + redirect-revalidation is the M2 adapter
-//! behind the [`WebIdResolver`] trait — M1 ships the trait, the gate, and the bidirectional check
-//! orchestration the verifier drives. A test resolver implements the trait deterministically.
+//! [`crate::ssrf`]). The actual network fetch + DNS-pinning + redirect-revalidation lives in the M2
+//! [`NetworkWebIdResolver`] (the `network` feature) behind the [`WebIdResolver`] trait, over the shared
+//! [`crate::net::SafeFetcher`]; the trait, the gate, and the bidirectional-check orchestration the
+//! verifier drives are the M1 core. A test resolver implements the trait deterministically.
 
 use std::collections::HashSet;
 
@@ -150,6 +151,92 @@ pub fn classify_resolved_address(
     Ok(())
 }
 
+// =====================================================================================================
+// M2 network adapter — the real WebIdResolver (DNS-pinned, redirect-revalidating, body-bounded fetch).
+// =====================================================================================================
+
+/// The real, network-backed [`WebIdResolver`] (M2). Fetches the WebID's profile document over the
+/// DNS-pinned, SSRF-guarded [`crate::net::SafeFetcher`] (resolve → classify every record → pin →
+/// no-auto-redirect/re-gate-each-hop → bounded body), parses it as Turtle via the W3C-driven `oxttl`
+/// parser, and returns the `solid:oidcIssuer` issuer set. A profile URL (or a redirect target) at a
+/// non-public address is refused exactly like any other SSRF target — the fetch fails closed, which the
+/// verifier's strict bidirectional mode treats as "not listed" → 401 (constant client message).
+///
+/// Only Turtle is parsed (the dominant Solid profile serialization, and what CSS/ESS/NSS publish at a
+/// WebID by default). The fetch sends an `Accept` favouring Turtle; a profile served only as JSON-LD is
+/// out of scope for this slice (a JSON-LD path is a follow-up — flagged in the M2 report).
+#[cfg(feature = "network")]
+pub struct NetworkWebIdResolver<R: crate::net::HostResolver = crate::net::SystemResolver> {
+    fetcher: crate::net::SafeFetcher<R>,
+}
+
+#[cfg(feature = "network")]
+impl NetworkWebIdResolver<crate::net::SystemResolver> {
+    /// Build a production resolver: the system-DNS SSRF-guarded fetcher. `allow_loopback` (dev/IT only)
+    /// permits an `http:`/loopback WebID host.
+    pub fn new(allow_loopback: bool) -> Result<Self, WebIdProfileError> {
+        let cfg = crate::net::SafeFetchConfig {
+            allow_loopback,
+            ..Default::default()
+        };
+        let fetcher = crate::net::SafeFetcher::system(cfg)
+            .map_err(|e| WebIdProfileError(format!("WebID fetcher init failed: {}", e.0)))?;
+        Ok(Self { fetcher })
+    }
+}
+
+#[cfg(feature = "network")]
+impl<R: crate::net::HostResolver> NetworkWebIdResolver<R> {
+    /// Build a resolver over an explicit fetcher (the test seam — inject adversarial DNS).
+    pub fn with_fetcher(fetcher: crate::net::SafeFetcher<R>) -> Self {
+        Self { fetcher }
+    }
+}
+
+#[cfg(feature = "network")]
+impl<R: crate::net::HostResolver> WebIdResolver for NetworkWebIdResolver<R> {
+    fn resolve(&self, web_id: &str) -> Result<WebIdProfile, WebIdProfileError> {
+        // The caller passes the already-canonicalised profile URL (fragment + userinfo stripped); the
+        // SafeFetcher re-applies the full static gate defensively at every hop.
+        let resp = self
+            .fetcher
+            // Prefer Turtle; many servers also content-negotiate. We parse Turtle only (see doc above).
+            .get(web_id, "text/turtle, application/x-turtle;q=0.9, */*;q=0.1")
+            .map_err(|e| WebIdProfileError(format!("WebID profile fetch failed: {}", e.0)))?;
+        let issuers = parse_oidc_issuers(&resp.body, &resp.final_url)?;
+        Ok(WebIdProfile { issuers })
+    }
+}
+
+/// Parse a Turtle profile body and collect every `solid:oidcIssuer` object that is a NamedNode IRI.
+/// Uses the streaming `oxttl` parser (bounded — the body is already byte-capped upstream). A literal
+/// (non-IRI) object of the predicate is ignored (an issuer must be an IRI). A syntax error aborts with
+/// a coarse error — we never echo the parse detail to the client.
+#[cfg(feature = "network")]
+fn parse_oidc_issuers(body: &[u8], base_url: &str) -> Result<HashSet<String>, WebIdProfileError> {
+    use oxrdf::Term;
+    use oxttl::TurtleParser;
+
+    let mut parser = TurtleParser::new();
+    // Resolve relative IRIs against the profile's effective URL (post-redirect), matching how a Turtle
+    // document's relative terms are interpreted. A non-absolute base is a no-op.
+    if let Ok(p) = TurtleParser::new().with_base_iri(base_url) {
+        parser = p;
+    }
+
+    let mut issuers = HashSet::new();
+    for triple in parser.for_slice(body) {
+        let triple = triple
+            .map_err(|_| WebIdProfileError("WebID profile is not valid Turtle.".to_string()))?;
+        if triple.predicate.as_str() == SOLID_OIDC_ISSUER {
+            if let Term::NamedNode(n) = &triple.object {
+                issuers.insert(n.as_str().to_string());
+            }
+        }
+    }
+    Ok(issuers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -221,5 +308,51 @@ mod tests {
         assert!(ssrf_gate_static("http://127.0.0.1/profile", true).is_ok());
         // ...but a public host over http: even with allow_loopback must be refused per address.
         assert!(ssrf_gate_static("http://8.8.8.8/profile", true).is_err());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_extracts_namednode_objects() {
+        let ttl = br#"
+            @prefix solid: <http://www.w3.org/ns/solid/terms#> .
+            <https://pod.example/alice/profile/card#me>
+                solid:oidcIssuer <https://idp.example/realms/solid> ,
+                                 <https://other-idp.example/> .
+        "#;
+        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice/profile/card").unwrap();
+        assert!(issuers.contains("https://idp.example/realms/solid"));
+        assert!(issuers.contains("https://other-idp.example/"));
+        assert_eq!(issuers.len(), 2);
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_ignores_literal_objects() {
+        // A literal (string) object of solid:oidcIssuer is NOT a valid issuer IRI — it must be dropped,
+        // never coerced into the issuer set (else a profile could "list" an arbitrary string).
+        let ttl = br#"
+            @prefix solid: <http://www.w3.org/ns/solid/terms#> .
+            <https://pod.example/alice#me> solid:oidcIssuer "https://idp.example/realms/solid" .
+        "#;
+        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice").unwrap();
+        assert!(issuers.is_empty());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_empty_when_predicate_absent() {
+        let ttl = br#"
+            @prefix foaf: <http://xmlns.com/foaf/0.1/> .
+            <https://pod.example/alice#me> foaf:name "Alice" .
+        "#;
+        let issuers = parse_oidc_issuers(ttl, "https://pod.example/alice").unwrap();
+        assert!(issuers.is_empty());
+    }
+
+    #[cfg(feature = "network")]
+    #[test]
+    fn parse_oidc_issuers_rejects_malformed_turtle() {
+        let ttl = b"this is not <turtle at all ;;;";
+        assert!(parse_oidc_issuers(ttl, "https://pod.example/alice").is_err());
     }
 }
