@@ -191,6 +191,7 @@ as the only ES512 verification dependency.
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps   # rustdoc, deny warnings (covers es512)
 cargo test
 cargo deny check          # advisory
 ```

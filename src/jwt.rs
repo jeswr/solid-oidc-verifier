@@ -102,7 +102,7 @@ pub fn proof_has_ath(proof: &str) -> bool {
 ///
 /// ES512 is ALWAYS rejected here as defence-in-depth: `Algorithm::ES512` does not exist on the
 /// `aws_lc_rs` backend, so even when the `es512` feature is enabled the ES512 token is verified on a
-/// SEPARATE pure-Rust path ([`verify_es512_over_candidates`]) that is forked BEFORE this function in
+/// SEPARATE pure-Rust path (`verify_es512_over_candidates`) that is forked BEFORE this function in
 /// [`verify_signature`]. Any caller that nonetheless reaches `map_algorithm` with ES512 gets a clear
 /// error rather than a silent fall-through — the two backends never share a code path.
 pub fn map_algorithm(alg: &str) -> Result<Algorithm, VerifyError> {

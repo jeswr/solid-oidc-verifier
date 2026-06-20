@@ -1,5 +1,5 @@
 # AUTHORED-BY Claude Opus 4.8
-# CI for solid-oidc-verifier: fmt --check + clippy -D warnings + test, plus an advisory cargo-deny lane.
+# CI for solid-oidc-verifier: fmt --check + clippy -D warnings + rustdoc -D warnings + test, plus an advisory cargo-deny lane.
 name: ci
 
 on:
@@ -14,7 +14,7 @@ env:
 
 jobs:
   gate:
-    name: fmt + clippy + test
+    name: fmt + clippy + rustdoc + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -27,6 +27,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Rustdoc (all features, deny warnings)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --all-features --no-deps
       - name: Test
         run: cargo test --all-features
 
