@@ -31,7 +31,9 @@ use axum::{
 use tokio::sync::oneshot;
 
 use solid_oidc_verifier::config::{JwksProvider, NetworkJwksProvider};
-use solid_oidc_verifier::net::{HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher};
+use solid_oidc_verifier::net::{
+    HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher, SystemResolver,
+};
 use solid_oidc_verifier::webid::{NetworkWebIdResolver, WebIdResolver};
 
 /// Serializes tests that mutate process-global proxy env vars so they can't race each other.
@@ -403,4 +405,91 @@ async fn ambient_proxy_env_is_ignored_dns_pin_holds() {
     .unwrap()
     .expect("fetch must succeed despite ambient proxy env (no_proxy honoured; DNS-pin holds)");
     assert_eq!(keys.len(), 1);
+}
+
+// =====================================================================================================
+// REGRESSION: the production `SystemResolver` must be safe to call from WITHIN a Tokio runtime.
+//
+// The conformance-blocking bug: the sync hickory `Resolver::lookup_ip` internally does
+// `Runtime::block_on`, which panics ("Cannot start a runtime from within a runtime") when the resolver
+// is driven from inside an existing Tokio runtime — exactly what happens when a Tokio/axum handler
+// (the CTH shim / solid-server-rs) calls `Verifier::verify` DIRECTLY (not via `spawn_blocking`). Every
+// other test in this file routes the blocking call through `spawn_blocking`, which is why they all
+// missed it. These tests call the REAL `SystemResolver` (and the full fetch path over it) directly on
+// the multi-threaded runtime — they would PANIC the worker before the resolver fix, and pass after it.
+//
+// Hermetic: `resolve_host` is exercised against a CONTROLLABLE host (`localhost` / a loopback literal)
+// and the full fetch path runs against the in-process loopback test server, so no live internet is
+// touched.
+// =====================================================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn system_resolver_resolve_host_does_not_panic_inside_a_runtime() {
+    // Build + use the PRODUCTION SystemResolver from inside a running Tokio runtime, directly (no
+    // spawn_blocking). Pre-fix, the internal sync hickory `block_on` panics here; post-fix it resolves
+    // on its own dedicated-thread runtime and returns localhost's loopback record(s).
+    let resolver = SystemResolver::new().expect("system resolver should construct");
+    let records = resolver
+        .resolve_host("localhost")
+        .expect("localhost must resolve (it is in /etc/hosts on every CI/dev host)");
+    assert!(
+        !records.is_empty(),
+        "localhost must resolve to at least one address"
+    );
+    assert!(
+        records.iter().all(|ip| ip.is_loopback()),
+        "localhost must resolve only to loopback addresses, got {records:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn system_resolver_full_fetch_path_no_block_on_panic_inside_runtime() {
+    // The exact failing scenario, end-to-end: a SafeFetcher backed by the PRODUCTION SystemResolver,
+    // its `.get()` called DIRECTLY from within the multi-threaded runtime (no spawn_blocking). The
+    // resolver resolves `localhost` → 127.0.0.1, the request is pinned + connects to the in-process
+    // loopback test server, and a 200 body comes back — proving no `Runtime::block_on` panic fires on
+    // the worker. This is the test that would have caught the conformance regression.
+    let body = r#"{"ok":true}"#;
+    let mut routes = HashMap::new();
+    routes.insert(
+        "/probe".to_string(),
+        Reply::Ok("application/json", body.to_string()),
+    );
+    let (addr, _shutdown) = start_server(routes).await;
+
+    // `allow_loopback=true` so the loopback connect is permitted; the SSRF per-record classification
+    // still runs on the resolved 127.0.0.1 (and accepts it only because allow_loopback is set).
+    let fetcher = SafeFetcher::system(loopback_cfg()).expect("system fetcher should construct");
+    let url = format!("http://localhost:{}/probe", addr.port());
+
+    // NOTE: called inline on the async runtime — NOT via spawn_blocking. This is the regression's
+    // trigger condition.
+    let resp = fetcher
+        .get(&url, "application/json")
+        .expect("fetch over the real system resolver must succeed from inside a runtime");
+    assert_eq!(resp.body, body.as_bytes());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn system_resolver_still_refuses_private_literal_inside_runtime() {
+    // SSRF guarantees are preserved by the async-resolver change: a loopback literal with the default
+    // (production) config is still refused — proving the fix did not relax classification. (No DNS
+    // happens for a literal host; this also confirms the static gate is untouched.)
+    let fetcher =
+        SafeFetcher::system(SafeFetchConfig::default()).expect("system fetcher should construct");
+    assert!(
+        fetcher
+            .get("https://127.0.0.1/jwks", "application/json")
+            .is_err(),
+        "a loopback literal must still be refused under the default config"
+    );
+    assert!(
+        fetcher
+            .get(
+                "https://169.254.169.254/latest/meta-data/",
+                "application/json"
+            )
+            .is_err(),
+        "the cloud-metadata literal must still be refused"
+    );
 }

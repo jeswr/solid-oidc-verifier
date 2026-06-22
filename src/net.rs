@@ -109,35 +109,127 @@ pub trait HostResolver: Send + Sync {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, SafeFetchError>;
 }
 
+/// A single DNS-resolution request handed to the resolver thread: the host to look up + a one-shot
+/// channel for the (full) record set or the coarse error.
+type ResolveJob = (
+    String,
+    std::sync::mpsc::Sender<Result<Vec<IpAddr>, SafeFetchError>>,
+);
+
 /// The production resolver: `hickory-resolver` reading the system config. Returns the FULL record set
 /// (every A + AAAA) so the per-record classification sees all of them.
+///
+/// ## Why a dedicated resolver thread + an ASYNC resolver (the runtime-panic fix)
+/// [`HostResolver::resolve_host`] is a **synchronous** trait method (so the whole sync `SafeFetcher`
+/// chain — and the sync `JwksProvider`/`WebIdResolver` seams the verifier drives — stay sync, and the
+/// blocking `reqwest::blocking` HTTP path, which spawns its OWN runtime thread, keeps working from
+/// inside a caller's runtime). But hickory's *synchronous* `Resolver::lookup_ip` internally does
+/// `Runtime::block_on`, which **panics** ("Cannot start a runtime from within a runtime") when it is
+/// invoked from inside an existing Tokio runtime — exactly what happens when a Tokio/axum handler (e.g.
+/// `solid-server-rs`) calls `Verifier::verify` directly (not via `spawn_blocking`).
+///
+/// The fix: own a dedicated background thread that runs a *current-thread* Tokio runtime and a
+/// [`hickory_resolver::TokioAsyncResolver`] (genuinely async `lookup_ip`). `resolve_host` ships the
+/// host to that thread over a channel and blocks on the reply. The `block_on` now happens on a thread
+/// that has NO ambient runtime, so it is legal — no panic — and the caller's runtime is never touched.
+/// The dedicated thread also serialises lookups, which is fine for our low-volume discovery/JWKS/WebID
+/// fetches (each result is cached upstream).
+///
+/// **SSRF guarantees are unchanged:** `resolve_host` still returns the FULL A+AAAA record set; every
+/// record is classified by [`SafeFetcher::get`] (the per-record public-address check, DNS-rebinding
+/// refusal, NAT64 decode), and the connection is still pinned to the validated IP(s). This thread does
+/// resolution only; it changes nothing about *which* addresses are accepted.
 pub struct SystemResolver {
-    inner: hickory_resolver::Resolver,
+    /// Send a job to the resolver thread. Wrapped in a `Mutex` so the (single) channel can be used from
+    /// `&self` across threads; the lock is held only for the duration of `send`.
+    tx: std::sync::Mutex<std::sync::mpsc::Sender<ResolveJob>>,
 }
 
 impl SystemResolver {
-    /// Build a resolver from the system's `/etc/resolv.conf` (falling back to a sane default on a
-    /// platform without one). Constructed once and reused.
+    /// Build the resolver: spawn the dedicated thread that owns a current-thread Tokio runtime + an
+    /// async `TokioAsyncResolver` (system `/etc/resolv.conf`, falling back to a sane default). The
+    /// runtime + resolver are built ON that thread (so no ambient-runtime requirement at construction),
+    /// and the thread loops serving resolution jobs until the `SystemResolver` (and thus the sender) is
+    /// dropped.
     pub fn new() -> Result<Self, SafeFetchError> {
-        let inner = hickory_resolver::Resolver::from_system_conf()
-            .or_else(|_| {
-                hickory_resolver::Resolver::new(
-                    hickory_resolver::config::ResolverConfig::default(),
-                    hickory_resolver::config::ResolverOpts::default(),
-                )
+        let (tx, rx) = std::sync::mpsc::channel::<ResolveJob>();
+        // A oneshot channel for the thread to report whether resolver init succeeded, so `new()` can
+        // surface an init failure synchronously (fail-closed) rather than only at first lookup.
+        let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
+
+        std::thread::Builder::new()
+            .name("solid-oidc-dns-resolver".to_string())
+            .spawn(move || {
+                // A current-thread runtime owned by THIS thread — `block_on` here is legal because the
+                // thread has no other runtime. (We never enter this runtime from the caller's thread.)
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        let _ = init_tx.send(Err(format!("DNS runtime init failed: {e}")));
+                        return;
+                    }
+                };
+
+                // Build the ASYNC resolver. `tokio_from_system_conf` reads /etc/resolv.conf; fall back
+                // to the default config on a platform/host without one (mirrors the prior behaviour).
+                let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
+                    .unwrap_or_else(|_| {
+                        hickory_resolver::TokioAsyncResolver::tokio(
+                            hickory_resolver::config::ResolverConfig::default(),
+                            hickory_resolver::config::ResolverOpts::default(),
+                        )
+                    });
+                // Resolver construction is infallible here (the fallback can't fail), so signal ready.
+                let _ = init_tx.send(Ok(()));
+
+                // Serve jobs until the sender is dropped (i.e. the SystemResolver is dropped).
+                while let Ok((host, reply)) = rx.recv() {
+                    let result = runtime.block_on(async {
+                        resolver
+                            .lookup_ip(host.as_str())
+                            .await
+                            .map(|lookup| lookup.iter().collect::<Vec<IpAddr>>())
+                            .map_err(|e| SafeFetchError(format!("DNS lookup failed: {e}")))
+                    });
+                    // If the requester has gone away, just drop the result and keep serving.
+                    let _ = reply.send(result);
+                }
             })
-            .map_err(|e| SafeFetchError(format!("DNS resolver init failed: {e}")))?;
-        Ok(Self { inner })
+            .map_err(|e| SafeFetchError(format!("DNS resolver thread spawn failed: {e}")))?;
+
+        // Wait for the thread to report resolver-init status (fail-closed if it couldn't even start).
+        match init_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                tx: std::sync::Mutex::new(tx),
+            }),
+            Ok(Err(msg)) => Err(SafeFetchError(msg)),
+            Err(_) => Err(SafeFetchError(
+                "DNS resolver thread exited before initialising.".to_string(),
+            )),
+        }
     }
 }
 
 impl HostResolver for SystemResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, SafeFetchError> {
-        let lookup = self
-            .inner
-            .lookup_ip(host)
-            .map_err(|e| SafeFetchError(format!("DNS lookup failed: {e}")))?;
-        Ok(lookup.iter().collect())
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        {
+            let tx = self
+                .tx
+                .lock()
+                .map_err(|_| SafeFetchError("DNS resolver channel poisoned.".to_string()))?;
+            tx.send((host.to_string(), reply_tx))
+                .map_err(|_| SafeFetchError("DNS resolver thread is not available.".to_string()))?;
+        }
+        // Block on the reply. This is a plain channel recv (NOT a Tokio runtime entry), so it is safe to
+        // call from inside a caller's async runtime — the async resolution itself runs on the dedicated
+        // resolver thread's own current-thread runtime, never on the caller's.
+        reply_rx
+            .recv()
+            .map_err(|_| SafeFetchError("DNS resolver thread dropped the request.".to_string()))?
     }
 }
 
@@ -218,70 +310,135 @@ impl<R: HostResolver> SafeFetcher<R> {
             let pinned_addrs: Vec<SocketAddr> =
                 pinned.iter().map(|ip| SocketAddr::new(*ip, port)).collect();
 
-            let mut builder = reqwest::blocking::Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(self.config.timeout)
-                // CRITICAL SSRF invariant: disable ambient proxy config. reqwest defaults to honouring
-                // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars; with a proxy set, reqwest connects to the
-                // PROXY and sends `CONNECT <target>`, so the proxy (not us) resolves the target — which
-                // bypasses our DNS-pin + per-record SSRF classification entirely. This fetcher controls
-                // its own egress; it must NOT inherit ambient proxy config. (Without this, a single
-                // HTTPS_PROXY env var turns the whole guard into a no-op.)
-                .no_proxy()
-                // Defence-in-depth: even though we pin, also forbid reqwest from following redirects on
-                // its own and cap the connect time within the overall timeout.
-                .connect_timeout(self.config.timeout);
-            builder = builder.resolve_to_addrs(&host, &pinned_addrs);
-            let client = builder
-                .build()
-                .map_err(|e| SafeFetchError(format!("HTTP client build failed: {e}")))?;
+            // (4)+(5)+(6) The reqwest::blocking HTTP exchange runs on a DEDICATED OS THREAD (see
+            // `http_hop_off_runtime`). reqwest's blocking client owns an internal Tokio runtime whose
+            // `Drop` JOINS its runtime thread — which PANICS ("Cannot drop a runtime ... from within an
+            // asynchronous context") if the client is constructed/dropped while a Tokio runtime is
+            // active on the calling thread (the conformance-blocking case: the verifier called directly
+            // from an axum handler). Doing the whole exchange on a plain `std::thread` keeps that
+            // runtime lifecycle entirely off the caller's async context. The host string + pinned
+            // addresses are the only inputs, so the SSRF pin/classification (done above) is unchanged.
+            let outcome = http_hop_off_runtime(HopRequest {
+                url: parsed.to_string(),
+                host: host.clone(),
+                accept: accept.to_string(),
+                pinned_addrs,
+                timeout: self.config.timeout,
+                max_body_bytes: self.config.max_body_bytes,
+            })?;
 
-            let resp = client
-                .get(parsed.as_str())
-                .header(reqwest::header::ACCEPT, accept)
-                .send()
-                .map_err(|e| SafeFetchError(format!("request failed: {e}")))?;
-
-            let status = resp.status();
-            if status.is_redirection() {
-                // (5) manual redirect: extract Location, resolve relative to the current URL, loop to
-                // re-gate it from scratch. We do NOT trust reqwest to follow it.
-                let location = resp
-                    .headers()
-                    .get(reqwest::header::LOCATION)
-                    .and_then(|v| v.to_str().ok())
-                    .ok_or_else(|| {
-                        SafeFetchError("redirect without a Location header.".to_string())
-                    })?
-                    .to_string();
-                let next = parsed
-                    .join(&location)
-                    .map_err(|_| SafeFetchError("redirect Location is malformed.".to_string()))?;
-                current = next.to_string();
-                continue;
-            }
-            if !status.is_success() {
-                return Err(SafeFetchError(format!("upstream returned HTTP {status}.")));
-            }
-
-            // (6) bounded body read. Honour Content-Length as an early reject, but ALSO cap the actual
-            // bytes read so a lying / chunked oversize body is still bounded. Compare in u64 space so a
-            // 32-bit `usize` cannot truncate a large advertised length into a small one.
-            if let Some(len) = resp.content_length() {
-                if len > self.config.max_body_bytes as u64 {
-                    return Err(SafeFetchError(
-                        "response body exceeds the size cap.".to_string(),
-                    ));
+            match outcome {
+                HopOutcome::Redirect(location) => {
+                    // (5) manual redirect: resolve relative to the current URL, loop to re-gate it from
+                    // scratch. We do NOT trust reqwest to follow it.
+                    let next = parsed.join(&location).map_err(|_| {
+                        SafeFetchError("redirect Location is malformed.".to_string())
+                    })?;
+                    current = next.to_string();
+                    continue;
+                }
+                HopOutcome::Body(body) => {
+                    return Ok(SafeResponse {
+                        body,
+                        final_url: parsed.to_string(),
+                    });
                 }
             }
-            let body = read_bounded(resp, self.config.max_body_bytes)?;
-            return Ok(SafeResponse {
-                body,
-                final_url: parsed.to_string(),
-            });
         }
         Err(SafeFetchError("too many redirects.".to_string()))
     }
+}
+
+/// The inputs for a single (already SSRF-gated + DNS-pinned) HTTP hop, sent to the off-runtime worker
+/// thread. Everything is owned (`String`/`Vec`) so it can cross the thread boundary.
+struct HopRequest {
+    url: String,
+    host: String,
+    accept: String,
+    pinned_addrs: Vec<SocketAddr>,
+    timeout: Duration,
+    max_body_bytes: usize,
+}
+
+/// The result of one HTTP hop: either a redirect Location to re-gate, or the (bounded) success body.
+enum HopOutcome {
+    Redirect(String),
+    Body(Vec<u8>),
+}
+
+/// Perform one reqwest::blocking HTTP hop on a DEDICATED OS THREAD, so the blocking client's internal
+/// Tokio-runtime lifecycle (construct + `Drop`-joins-its-thread) never runs on the caller's async
+/// context. This is what makes the whole sync fetch path safe to invoke from inside a Tokio runtime
+/// (an axum handler calling `Verifier::verify` directly). The thread has no ambient runtime, so the
+/// reqwest blocking client builds, sends, reads, and drops without tripping Tokio's "drop a runtime
+/// from within an asynchronous context" guard.
+fn http_hop_off_runtime(req: HopRequest) -> Result<HopOutcome, SafeFetchError> {
+    let handle = std::thread::Builder::new()
+        .name("solid-oidc-http-hop".to_string())
+        .spawn(move || run_http_hop(req))
+        .map_err(|e| SafeFetchError(format!("HTTP worker thread spawn failed: {e}")))?;
+    // Joining a plain OS thread is a normal blocking call (not a Tokio runtime drop), so it is safe
+    // from within an async context. The reqwest runtime was created AND dropped inside the closure on
+    // that thread.
+    handle
+        .join()
+        .map_err(|_| SafeFetchError("HTTP worker thread panicked.".to_string()))?
+}
+
+/// The body of one HTTP hop, executed on the dedicated worker thread (no ambient runtime). Builds the
+/// pinned, no-proxy, no-auto-redirect blocking client, sends the GET, and returns either the redirect
+/// Location or the bounded success body. Identical request semantics to the previous inline code.
+fn run_http_hop(req: HopRequest) -> Result<HopOutcome, SafeFetchError> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(req.timeout)
+        // CRITICAL SSRF invariant: disable ambient proxy config. reqwest defaults to honouring
+        // HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars; with a proxy set, reqwest connects to the
+        // PROXY and sends `CONNECT <target>`, so the proxy (not us) resolves the target — which
+        // bypasses our DNS-pin + per-record SSRF classification entirely. This fetcher controls
+        // its own egress; it must NOT inherit ambient proxy config. (Without this, a single
+        // HTTPS_PROXY env var turns the whole guard into a no-op.)
+        .no_proxy()
+        // Defence-in-depth: even though we pin, also forbid reqwest from following redirects on
+        // its own and cap the connect time within the overall timeout.
+        .connect_timeout(req.timeout);
+    builder = builder.resolve_to_addrs(&req.host, &req.pinned_addrs);
+    let client = builder
+        .build()
+        .map_err(|e| SafeFetchError(format!("HTTP client build failed: {e}")))?;
+
+    let resp = client
+        .get(req.url.as_str())
+        .header(reqwest::header::ACCEPT, req.accept.as_str())
+        .send()
+        .map_err(|e| SafeFetchError(format!("request failed: {e}")))?;
+
+    let status = resp.status();
+    if status.is_redirection() {
+        let location = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .ok_or_else(|| SafeFetchError("redirect without a Location header.".to_string()))?
+            .to_string();
+        return Ok(HopOutcome::Redirect(location));
+    }
+    if !status.is_success() {
+        return Err(SafeFetchError(format!("upstream returned HTTP {status}.")));
+    }
+
+    // (6) bounded body read. Honour Content-Length as an early reject, but ALSO cap the actual
+    // bytes read so a lying / chunked oversize body is still bounded. Compare in u64 space so a
+    // 32-bit `usize` cannot truncate a large advertised length into a small one.
+    if let Some(len) = resp.content_length() {
+        if len > req.max_body_bytes as u64 {
+            return Err(SafeFetchError(
+                "response body exceeds the size cap.".to_string(),
+            ));
+        }
+    }
+    let body = read_bounded(resp, req.max_body_bytes)?;
+    Ok(HopOutcome::Body(body))
 }
 
 /// Read a response body with a hard byte cap. Reads in chunks and aborts the moment the cap is
