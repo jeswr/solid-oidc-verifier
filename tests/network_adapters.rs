@@ -127,6 +127,38 @@ async fn start_server(routes: HashMap<String, Reply>) -> (SocketAddr, oneshot::S
     start_server_with(|_addr| routes).await
 }
 
+/// Like [`start_server`] but binds a CALLER-CHOSEN loopback address (e.g. `127.0.0.1` or `::1`) instead
+/// of always `127.0.0.1`. Used by the `localhost` fetch regression test so the listener's loopback
+/// family matches whatever the real `SystemResolver` returns for `localhost` (some hosts map it only to
+/// `::1`, others only to `127.0.0.1`) — otherwise the test fails for ENVIRONMENT reasons (the resolver
+/// pins a family the server isn't listening on), not a real regression.
+async fn start_server_on(
+    bind_ip: IpAddr,
+    routes: HashMap<String, Reply>,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::new(bind_ip, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let state = ServerState {
+        routes: Arc::new(routes),
+    };
+    let app = Router::new()
+        .route("/", get(serve))
+        .route("/*rest", get(serve))
+        .with_state(state);
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    (addr, tx)
+}
+
 /// A loopback-permitting fetch config (so the test server's 127.0.0.1 connect is allowed). Production
 /// leaves `allow_loopback=false`.
 fn loopback_cfg() -> SafeFetchConfig {
@@ -446,19 +478,38 @@ async fn system_resolver_resolve_host_does_not_panic_inside_a_runtime() {
 async fn system_resolver_full_fetch_path_no_block_on_panic_inside_runtime() {
     // The exact failing scenario, end-to-end: a SafeFetcher backed by the PRODUCTION SystemResolver,
     // its `.get()` called DIRECTLY from within the multi-threaded runtime (no spawn_blocking). The
-    // resolver resolves `localhost` → 127.0.0.1, the request is pinned + connects to the in-process
-    // loopback test server, and a 200 body comes back — proving no `Runtime::block_on` panic fires on
-    // the worker. This is the test that would have caught the conformance regression.
+    // resolver resolves `localhost` → its loopback record(s), the request is pinned + connects to the
+    // in-process loopback test server, and a 200 body comes back — proving no `Runtime::block_on` panic
+    // fires on the worker. This is the test that would have caught the conformance regression.
     let body = r#"{"ok":true}"#;
     let mut routes = HashMap::new();
     routes.insert(
         "/probe".to_string(),
         Reply::Ok("application/json", body.to_string()),
     );
-    let (addr, _shutdown) = start_server(routes).await;
+
+    // Bind the listener to whatever loopback family the REAL resolver returns for `localhost` (127.0.0.1
+    // OR ::1 — it varies by host). Otherwise the fetcher would pin `localhost` to a family the server is
+    // not listening on (e.g. resolver → ::1 but the server bound only 127.0.0.1), failing for
+    // environment reasons rather than a real regression. We still exercise the real `SystemResolver`
+    // path: the fetcher itself resolves `localhost` (we only use the resolution here to pick the bind
+    // family). All returned records must be loopback (asserted), so binding the first is safe.
+    let probe = SystemResolver::new().expect("system resolver should construct");
+    let records = probe
+        .resolve_host("localhost")
+        .expect("localhost must resolve on every CI/dev host");
+    assert!(
+        records.iter().all(|ip| ip.is_loopback()),
+        "localhost must resolve only to loopback addresses, got {records:?}"
+    );
+    let bind_ip = *records
+        .first()
+        .expect("localhost must resolve to >=1 address");
+    drop(probe);
+    let (addr, _shutdown) = start_server_on(bind_ip, routes).await;
 
     // `allow_loopback=true` so the loopback connect is permitted; the SSRF per-record classification
-    // still runs on the resolved 127.0.0.1 (and accepts it only because allow_loopback is set).
+    // still runs on the resolved loopback record(s) (accepted only because allow_loopback is set).
     let fetcher = SafeFetcher::system(loopback_cfg()).expect("system fetcher should construct");
     let url = format!("http://localhost:{}/probe", addr.port());
 

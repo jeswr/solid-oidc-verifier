@@ -111,6 +111,11 @@ pub trait HostResolver: Send + Sync {
 
 /// A single DNS-resolution request handed to the resolver thread: the host to look up + a one-shot
 /// channel for the (full) record set or the coarse error.
+///
+/// The reply channel is a plain `std::sync::mpsc::Sender` so the (synchronous) caller in
+/// [`HostResolver::resolve_host`] can block on the reply with an ordinary `recv()` — no Tokio runtime
+/// entry on the caller's thread. The *job* channel (host → resolver thread) is an async tokio channel
+/// (see [`SystemResolver`]) so the dispatch loop can `tokio::spawn` each lookup CONCURRENTLY.
 type ResolveJob = (
     String,
     std::sync::mpsc::Sender<Result<Vec<IpAddr>, SafeFetchError>>,
@@ -132,17 +137,26 @@ type ResolveJob = (
 /// [`hickory_resolver::TokioAsyncResolver`] (genuinely async `lookup_ip`). `resolve_host` ships the
 /// host to that thread over a channel and blocks on the reply. The `block_on` now happens on a thread
 /// that has NO ambient runtime, so it is legal — no panic — and the caller's runtime is never touched.
-/// The dedicated thread also serialises lookups, which is fine for our low-volume discovery/JWKS/WebID
-/// fetches (each result is cached upstream).
+///
+/// ## Concurrent lookups (the head-of-line-blocking fix)
+/// The resolver thread drives lookups CONCURRENTLY rather than one-at-a-time. A `TokioAsyncResolver` is
+/// cheaply cloneable (`Arc`-shared internals), so the dispatch loop — a single `block_on` of an async
+/// task that drains the (async) job channel — `tokio::spawn`s each `lookup_ip` onto the thread's runtime
+/// with its own clone of the resolver and replies on that job's own oneshot channel. A slow lookup
+/// therefore CANNOT head-of-line-block a fast one sharing the same `SystemResolver`: N concurrent
+/// `resolve_host` calls run in parallel. (The thread's runtime is current-thread, so the spawned tasks
+/// are cooperatively multiplexed on the one resolver thread — which is exactly right for I/O-bound DNS
+/// waits: a task awaiting a slow nameserver yields, letting a fast lookup complete and reply first.)
 ///
 /// **SSRF guarantees are unchanged:** `resolve_host` still returns the FULL A+AAAA record set; every
 /// record is classified by [`SafeFetcher::get`] (the per-record public-address check, DNS-rebinding
 /// refusal, NAT64 decode), and the connection is still pinned to the validated IP(s). This thread does
 /// resolution only; it changes nothing about *which* addresses are accepted.
 pub struct SystemResolver {
-    /// Send a job to the resolver thread. Wrapped in a `Mutex` so the (single) channel can be used from
-    /// `&self` across threads; the lock is held only for the duration of `send`.
-    tx: std::sync::Mutex<std::sync::mpsc::Sender<ResolveJob>>,
+    /// Send a job to the resolver thread over an ASYNC tokio channel (so the dispatch loop can await it
+    /// and spawn each lookup concurrently). Cloneable + `Send`/`Sync`, so it is used directly from
+    /// `&self` across threads — no `Mutex` needed.
+    tx: tokio::sync::mpsc::UnboundedSender<ResolveJob>,
 }
 
 impl SystemResolver {
@@ -152,7 +166,9 @@ impl SystemResolver {
     /// and the thread loops serving resolution jobs until the `SystemResolver` (and thus the sender) is
     /// dropped.
     pub fn new() -> Result<Self, SafeFetchError> {
-        let (tx, rx) = std::sync::mpsc::channel::<ResolveJob>();
+        // ASYNC job channel: the dispatch loop awaits it inside `block_on` and `tokio::spawn`s each
+        // lookup, so a slow lookup cannot head-of-line-block a fast one.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ResolveJob>();
         // A oneshot channel for the thread to report whether resolver init succeeded, so `new()` can
         // surface an init failure synchronously (fail-closed) rather than only at first lookup.
         let (init_tx, init_rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -175,6 +191,7 @@ impl SystemResolver {
 
                 // Build the ASYNC resolver. `tokio_from_system_conf` reads /etc/resolv.conf; fall back
                 // to the default config on a platform/host without one (mirrors the prior behaviour).
+                // Cloneable (`Arc`-shared internals) so each spawned lookup gets its own cheap clone.
                 let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
                     .unwrap_or_else(|_| {
                         hickory_resolver::TokioAsyncResolver::tokio(
@@ -185,26 +202,24 @@ impl SystemResolver {
                 // Resolver construction is infallible here (the fallback can't fail), so signal ready.
                 let _ = init_tx.send(Ok(()));
 
-                // Serve jobs until the sender is dropped (i.e. the SystemResolver is dropped).
-                while let Ok((host, reply)) = rx.recv() {
-                    let result = runtime.block_on(async {
+                // Drive the shared concurrent dispatch loop with the production hickory lookup. Each job
+                // clones the (`Arc`-shared) resolver into its own spawned task — see `run_resolver_loop`.
+                runtime.block_on(run_resolver_loop(rx, move |host| {
+                    let resolver = resolver.clone();
+                    async move {
                         resolver
                             .lookup_ip(host.as_str())
                             .await
                             .map(|lookup| lookup.iter().collect::<Vec<IpAddr>>())
                             .map_err(|e| SafeFetchError(format!("DNS lookup failed: {e}")))
-                    });
-                    // If the requester has gone away, just drop the result and keep serving.
-                    let _ = reply.send(result);
-                }
+                    }
+                }));
             })
             .map_err(|e| SafeFetchError(format!("DNS resolver thread spawn failed: {e}")))?;
 
         // Wait for the thread to report resolver-init status (fail-closed if it couldn't even start).
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self {
-                tx: std::sync::Mutex::new(tx),
-            }),
+            Ok(Ok(())) => Ok(Self { tx }),
             Ok(Err(msg)) => Err(SafeFetchError(msg)),
             Err(_) => Err(SafeFetchError(
                 "DNS resolver thread exited before initialising.".to_string(),
@@ -213,20 +228,45 @@ impl SystemResolver {
     }
 }
 
+/// The CONCURRENT dispatch loop shared by production and the concurrency regression test. Drains the
+/// async job channel and `tokio::spawn`s `lookup(host)` for each job onto the ambient (current-thread)
+/// runtime, so a slow lookup never head-of-line-blocks a fast one — each spawned task replies on its
+/// OWN reply channel, fully independently. The loop ends when the last sender is dropped and the channel
+/// closes (then awaiting in-flight tasks finish via their own spawned futures).
+///
+/// `lookup` is the per-host async resolution; production passes the hickory `lookup_ip` closure, the
+/// test passes a controllable stub (one host slow, one fast). Driving BOTH through this one function is
+/// what makes the test prove the REAL dispatch path is concurrent, not a hand-rolled copy of it.
+async fn run_resolver_loop<F, Fut>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<ResolveJob>,
+    lookup: F,
+) where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<IpAddr>, SafeFetchError>> + Send + 'static,
+{
+    while let Some((host, reply)) = rx.recv().await {
+        // Build the per-job future BEFORE spawning (so the closure's captured clone is moved into this
+        // job's future), then spawn it — each job runs independently.
+        let fut = lookup(host);
+        tokio::spawn(async move {
+            // If the requester has gone away, just drop the result.
+            let _ = reply.send(fut.await);
+        });
+    }
+}
+
 impl HostResolver for SystemResolver {
     fn resolve_host(&self, host: &str) -> Result<Vec<IpAddr>, SafeFetchError> {
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        {
-            let tx = self
-                .tx
-                .lock()
-                .map_err(|_| SafeFetchError("DNS resolver channel poisoned.".to_string()))?;
-            tx.send((host.to_string(), reply_tx))
-                .map_err(|_| SafeFetchError("DNS resolver thread is not available.".to_string()))?;
-        }
+        // The async job sender is cloneable + thread-safe, so no lock is needed; sending is
+        // non-blocking (unbounded channel). The reply travels back on a plain std channel.
+        self.tx
+            .send((host.to_string(), reply_tx))
+            .map_err(|_| SafeFetchError("DNS resolver thread is not available.".to_string()))?;
         // Block on the reply. This is a plain channel recv (NOT a Tokio runtime entry), so it is safe to
         // call from inside a caller's async runtime — the async resolution itself runs on the dedicated
-        // resolver thread's own current-thread runtime, never on the caller's.
+        // resolver thread's own current-thread runtime, never on the caller's. Because each lookup is
+        // spawned independently on that runtime, a slow lookup does not block this (or any other) reply.
         reply_rx
             .recv()
             .map_err(|_| SafeFetchError("DNS resolver thread dropped the request.".to_string()))?
@@ -568,5 +608,88 @@ mod tests {
         assert!(f
             .get("https://does-not-resolve.example/jwks", "application/json")
             .is_err());
+    }
+
+    // =================================================================================================
+    // CONCURRENCY regression (the Medium fix): the resolver dispatch loop must NOT serialise lookups —
+    // a slow lookup must not head-of-line-block a fast one sharing the same resolver thread/runtime.
+    //
+    // This drives the REAL production dispatch loop (`run_resolver_loop`) on a dedicated thread with its
+    // own current-thread runtime — exactly as `SystemResolver::new` wires it — but injects a
+    // CONTROLLABLE async lookup stub: host "slow" awaits a long delay, host "fast" returns immediately.
+    // Two jobs are submitted back-to-back (slow first, so a serial loop would make the fast one wait
+    // behind it); the test asserts the FAST reply arrives well BEFORE the slow one could have. A serial
+    // (await-each-inline) loop FAILS this; the concurrent (`tokio::spawn`-per-job) loop PASSES it.
+    // =================================================================================================
+    #[test]
+    fn resolver_loop_does_not_serialize_a_slow_lookup_ahead_of_a_fast_one() {
+        use std::sync::mpsc::{channel, RecvTimeoutError};
+        use std::time::{Duration, Instant};
+
+        // The injected concurrent dispatch loop runs the SAME `run_resolver_loop` production uses.
+        let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel::<ResolveJob>();
+        let handle = std::thread::Builder::new()
+            .name("test-dns-loop".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                rt.block_on(run_resolver_loop(job_rx, |host: String| async move {
+                    if host == "slow" {
+                        // A long delay relative to the fast path: a serial loop would block the fast
+                        // lookup for this entire duration.
+                        tokio::time::sleep(Duration::from_millis(800)).await;
+                        Ok(vec!["10.0.0.1".parse().unwrap()])
+                    } else {
+                        // Fast path: resolves essentially instantly.
+                        Ok(vec!["8.8.8.8".parse().unwrap()])
+                    }
+                }));
+            })
+            .expect("spawn test dns loop");
+
+        // Submit the SLOW job first, then the FAST job immediately after — so a head-of-line-blocking
+        // (serial) loop would force the fast reply to wait for the slow one.
+        let (slow_reply_tx, slow_reply_rx) = channel();
+        job_tx.send(("slow".to_string(), slow_reply_tx)).unwrap();
+        let (fast_reply_tx, fast_reply_rx) = channel();
+        job_tx.send(("fast".to_string(), fast_reply_tx)).unwrap();
+
+        let start = Instant::now();
+        // The fast reply MUST arrive promptly — far sooner than the slow lookup's 800ms. We give it a
+        // generous 300ms ceiling (well under 800ms) to stay robust on a loaded CI box while still
+        // proving non-serialisation.
+        let fast = fast_reply_rx
+            .recv_timeout(Duration::from_millis(300))
+            .expect("fast lookup must return without waiting for the slow one (NOT serialised)");
+        let fast_elapsed = start.elapsed();
+        assert!(
+            fast.is_ok(),
+            "fast lookup should succeed, got {:?}",
+            fast.err()
+        );
+        assert_eq!(fast.unwrap(), vec!["8.8.8.8".parse::<IpAddr>().unwrap()]);
+        assert!(
+            fast_elapsed < Duration::from_millis(700),
+            "fast lookup returned in {fast_elapsed:?} — that is ~the slow lookup's duration, so the \
+             loop SERIALISED (head-of-line blocked) instead of running concurrently"
+        );
+
+        // Sanity: the slow lookup is still in flight (it should NOT have completed by now) and does
+        // eventually return correctly — proving both ran, just concurrently rather than serially.
+        match slow_reply_rx.recv_timeout(Duration::from_millis(50)) {
+            Err(RecvTimeoutError::Timeout) => {} // expected: slow lookup hasn't finished yet
+            other => panic!("slow lookup should still be in flight, got {other:?}"),
+        }
+        let slow = slow_reply_rx
+            .recv_timeout(Duration::from_millis(1500))
+            .expect("slow lookup must eventually return")
+            .expect("slow lookup result");
+        assert_eq!(slow, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+
+        // Dropping the sender closes the channel → the loop ends → the thread joins cleanly.
+        drop(job_tx);
+        handle.join().expect("test dns loop thread should join");
     }
 }
