@@ -117,8 +117,14 @@ pub use jwk::{Jwk, JwkError, ES512_KNOWN_NARROWING, SIGNING_ALGS};
 #[cfg(feature = "network")]
 pub use net::{HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher, SystemResolver};
 pub use replay::{InMemoryReplayStore, MarkResult, ReplayBackendError, ReplayStore};
-pub use ssrf::{is_loopback_address, is_public_address};
+pub use ssrf::{
+    is_loopback_address, is_public_address, is_public_address_with_nat64, Nat64Nsp, Nat64NspError,
+    Nat64Policy,
+};
 pub use verifier::{AuthRequest, VerifiedToken, Verifier};
 #[cfg(feature = "network")]
 pub use webid::NetworkWebIdResolver;
-pub use webid::{BidirectionalMode, WebIdProfile, WebIdProfileError, WebIdResolver};
+pub use webid::{
+    classify_resolved_address_with_nat64, ssrf_gate_static_with_nat64, BidirectionalMode,
+    WebIdProfile, WebIdProfileError, WebIdResolver,
+};

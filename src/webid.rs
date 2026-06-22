@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use url::Url;
 
 use crate::error::{invalid_token, VerifyError};
-use crate::ssrf::{is_loopback_address, is_public_address};
+use crate::ssrf::{is_loopback_address, is_public_address_with_nat64, Nat64Policy};
 
 /// The `solid:oidcIssuer` predicate IRI (Solid-OIDC §4).
 pub const SOLID_OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
@@ -96,7 +96,20 @@ pub fn canonicalise_profile_url(web_id: &str) -> String {
 ///
 /// `allow_loopback` permits `http:` to a loopback literal (dev/IT). A hostname host returns
 /// `Ok(())` here — the caller must still DNS-resolve + classify every record before connecting.
+///
+/// Uses the STRICT NAT64 policy (well-known `/96` only). For an operator-configured NAT64 NSP
+/// allowlist, use [`ssrf_gate_static_with_nat64`].
 pub fn ssrf_gate_static(raw_url: &str, allow_loopback: bool) -> Result<(), WebIdProfileError> {
+    ssrf_gate_static_with_nat64(raw_url, allow_loopback, &Nat64Policy::strict())
+}
+
+/// As [`ssrf_gate_static`], but honouring an operator-configured NAT64 NSP allowlist when classifying
+/// an IPv6 literal host (default-OFF: an empty/strict policy gives identical behaviour).
+pub fn ssrf_gate_static_with_nat64(
+    raw_url: &str,
+    allow_loopback: bool,
+    nat64: &Nat64Policy,
+) -> Result<(), WebIdProfileError> {
     let url = Url::parse(raw_url)
         .map_err(|_| WebIdProfileError(format!("WebID profile URL is malformed: {raw_url}.")))?;
     match url.scheme() {
@@ -127,7 +140,7 @@ pub fn ssrf_gate_static(raw_url: &str, allow_loopback: bool) -> Result<(), WebId
         let is_literal = stripped.parse::<std::net::Ipv4Addr>().is_ok()
             || stripped.parse::<std::net::Ipv6Addr>().is_ok();
         if is_literal {
-            classify_resolved_address(stripped, &url, allow_loopback)?;
+            classify_resolved_address_with_nat64(stripped, &url, allow_loopback, nat64)?;
         }
     }
     Ok(())
@@ -137,17 +150,31 @@ pub fn ssrf_gate_static(raw_url: &str, allow_loopback: bool) -> Result<(), WebId
 /// `allow_loopback` must resolve to a loopback address; every address must be public (or loopback when
 /// allowed). The network adapter calls this for each DNS record; the static gate calls it for an IP
 /// literal host. Public — reused by the M2 adapter.
+///
+/// Uses the STRICT NAT64 policy (well-known `/96` only). For an operator-configured NAT64 NSP
+/// allowlist, use [`classify_resolved_address_with_nat64`].
 pub fn classify_resolved_address(
     address: &str,
     url: &Url,
     allow_loopback: bool,
+) -> Result<(), WebIdProfileError> {
+    classify_resolved_address_with_nat64(address, url, allow_loopback, &Nat64Policy::strict())
+}
+
+/// As [`classify_resolved_address`], but honouring an operator-configured NAT64 NSP allowlist
+/// (default-OFF: an empty/strict policy gives identical behaviour).
+pub fn classify_resolved_address_with_nat64(
+    address: &str,
+    url: &Url,
+    allow_loopback: bool,
+    nat64: &Nat64Policy,
 ) -> Result<(), WebIdProfileError> {
     if url.scheme() == "http" && allow_loopback && !is_loopback_address(address) {
         return Err(WebIdProfileError(format!(
             "WebID profile URL refused — http: WebID allowed only when ALL resolved addresses are loopback (got {address}). Use https: in production."
         )));
     }
-    if !is_public_address(address, allow_loopback) {
+    if !is_public_address_with_nat64(address, allow_loopback, nat64) {
         let host = url.host_str().unwrap_or("");
         return Err(WebIdProfileError(format!(
             "WebID profile URL refused — {host} resolves to a non-public address ({address})."

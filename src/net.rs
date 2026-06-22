@@ -33,7 +33,10 @@ use std::time::Duration;
 
 use url::Url;
 
-use crate::webid::{classify_resolved_address, ssrf_gate_static, WebIdProfileError};
+use crate::ssrf::Nat64Policy;
+use crate::webid::{
+    classify_resolved_address_with_nat64, ssrf_gate_static_with_nat64, WebIdProfileError,
+};
 
 /// Hard cap on a fetched body (discovery doc / JWKS / WebID profile). 1 MiB is far above any real
 /// JWKS or profile document and bounds the DoS surface of an attacker-controlled (or
@@ -78,6 +81,12 @@ pub struct SafeFetchConfig {
     pub max_body_bytes: usize,
     /// Max manual (re-gated) redirect hops.
     pub max_redirects: usize,
+    /// Operator-configured NAT64 NSP allowlist (opt-in, default-OFF / empty). When non-empty, an
+    /// IPv6 resolved-record (or IP-literal host) that falls under a configured NSP has its embedded
+    /// IPv4 decoded and re-classified, so an embedded private/loopback/link-local v4 is refused. The
+    /// IANA well-known `64:ff9b::/96` is ALWAYS decoded regardless of this list (strict baseline).
+    /// Mirrors the `allow_loopback` seam: default-OFF, opt-in only.
+    pub nat64: Nat64Policy,
 }
 
 impl Default for SafeFetchConfig {
@@ -87,6 +96,7 @@ impl Default for SafeFetchConfig {
             timeout: DEFAULT_TIMEOUT,
             max_body_bytes: MAX_BODY_BYTES,
             max_redirects: MAX_REDIRECTS,
+            nat64: Nat64Policy::strict(),
         }
     }
 }
@@ -164,7 +174,7 @@ impl<R: HostResolver> SafeFetcher<R> {
         // 0..=max_redirects: the initial request plus up to `max_redirects` followed hops.
         for _hop in 0..=self.config.max_redirects {
             // (1) static gate (scheme/userinfo/IP-literal) on THIS hop's URL.
-            ssrf_gate_static(&current, self.config.allow_loopback)?;
+            ssrf_gate_static_with_nat64(&current, self.config.allow_loopback, &self.config.nat64)?;
             let parsed = Url::parse(&current)
                 .map_err(|_| SafeFetchError("URL is malformed.".to_string()))?;
             let host = parsed
@@ -190,10 +200,11 @@ impl<R: HostResolver> SafeFetcher<R> {
                     // classify_resolved_address enforces: http+allow_loopback ⇒ must be loopback; and
                     // every record must be public (or loopback when allowed). ANY non-public record
                     // fails the WHOLE request — the attacker cannot mix a public + private record.
-                    classify_resolved_address(
+                    classify_resolved_address_with_nat64(
                         &ip.to_string(),
                         &parsed,
                         self.config.allow_loopback,
+                        &self.config.nat64,
                     )?;
                 }
                 records

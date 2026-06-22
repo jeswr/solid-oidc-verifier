@@ -5,12 +5,31 @@
 //! Refuses: loopback, link-local, IPv4 private (RFC 1918), CGNAT (RFC 6598), IPv4 reserved/test
 //! ranges, multicast, broadcast, `0.0.0.0/8`, IPv4-mapped IPv6, IPv6 ULA (`fc00::/7`), IPv6
 //! unspecified, **6to4 (`2002::/16`) embedding a private v4**, and **NAT64 (RFC 6052) embedding a
-//! private v4 at the IANA well-known prefix `64:ff9b::/96`**. Operator-defined NAT64
-//! Network-Specific Prefixes (NSPs) are deliberately NOT matched: their layout (RFC 6052 §2.2)
-//! has no globally-known structural discriminator, so speculatively reading a private v4 out of
-//! every address that *could* be an NSP embedding would false-block legitimate sparse global IPv6.
-//! An operator that runs a custom NSP fronts it with its own egress policy. `allow_loopback`
-//! re-permits loopback only (dev / IT).
+//! private v4 at the IANA well-known prefix `64:ff9b::/96`**.
+//!
+//! ## Operator-configured NAT64 NSP allowlist (opt-in, default-OFF)
+//!
+//! Operator-defined NAT64 Network-Specific Prefixes (NSPs) are deliberately NOT matched
+//! *speculatively*: their layout (RFC 6052 §2.2) has no globally-known structural discriminator, so
+//! reading a private v4 out of every address that *could* be an NSP embedding would false-block
+//! legitimate sparse global IPv6. So by default ([`Nat64Policy::default`] / [`is_public_address`])
+//! only the IANA well-known `/96` is decoded — behaviour identical to before this allowlist existed.
+//!
+//! When an operator KNOWS they run a custom NSP, they can opt in by supplying it via
+//! [`Nat64Policy`] (mirroring the existing `allow_loopback` config seam). For a v6 address that falls
+//! under a *configured* NSP, the classifier DECODES the embedded IPv4 (RFC 6052 §2.2 bit layout — the
+//! v4 straddles the reserved "u" octet at bits 64–71) and classifies on THAT v4, so an embedded
+//! private/loopback/link-local v4 (e.g. `<nsp>:169.254.169.254`) is still rejected. This closes the
+//! M2 SSRF-audit NAT64-NSP Low for operators that run an NSP, without re-introducing the false-block
+//! risk for everyone else.
+//!
+//! **Fail-closed:** an address that does NOT fall under the well-known prefix OR any configured NSP
+//! is classified by its raw IPv6 form (no silent allow). A configured NSP only ever makes the guard
+//! *stricter* (it can decode-and-reject an embedded private v4); it never relaxes classification of
+//! an address that wasn't already public, because a decoded *public* embedded v4 still had to pass
+//! the full IPv4 classifier.
+//!
+//! `allow_loopback` re-permits loopback only (dev / IT).
 //!
 //! The verifier's WebID resolution uses this to refuse a profile URL that resolves to a non-public
 //! address (the DNS-rebinding + private-network guard, TS risk R5). M1 implements the classifier (the
@@ -19,15 +38,188 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// A single operator-configured NAT64 Network-Specific Prefix (RFC 6052 §2.2). Constructed from a
+/// prefix IPv6 address + a prefix length the RFC permits for embedding (`32, 40, 48, 56, 64, 96`).
+/// An address that falls under this prefix has its embedded IPv4 decoded and re-classified.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Nat64Nsp {
+    /// The prefix's high segments, masked to `prefix_len` bits (so equality + matching are exact).
+    masked: [u16; 8],
+    /// The prefix length in bits — one of the RFC 6052 §2.2 embedding lengths.
+    prefix_len: u8,
+}
+
+/// Failure parsing an operator-supplied NAT64 NSP (bad address, or a length RFC 6052 §2.2 forbids).
+#[derive(Debug, thiserror::Error)]
+#[error("invalid NAT64 NSP: {0}")]
+pub struct Nat64NspError(pub String);
+
+impl Nat64Nsp {
+    /// The prefix lengths RFC 6052 §2.2 defines for IPv4 embedding. The well-known `64:ff9b::/96` is
+    /// the `/96` member and is handled separately (always-on), but a `/96` NSP is still accepted here.
+    const VALID_LENGTHS: [u8; 6] = [32, 40, 48, 56, 64, 96];
+
+    /// Parse an operator NSP from `"<ipv6-prefix>/<len>"` (e.g. `"64:ff9b:1::/48"`). The length must be
+    /// one of the RFC 6052 §2.2 embedding lengths. Bits below the prefix length are masked to zero so
+    /// matching is exact and two equivalent CIDR spellings compare equal.
+    pub fn parse(cidr: &str) -> Result<Self, Nat64NspError> {
+        let (addr_str, len_str) = cidr
+            .split_once('/')
+            .ok_or_else(|| Nat64NspError(format!("expected `<ipv6>/<len>` form, got `{cidr}`")))?;
+        let prefix_len: u8 = len_str
+            .trim()
+            .parse()
+            .map_err(|_| Nat64NspError(format!("prefix length is not a number: `{len_str}`")))?;
+        let addr: Ipv6Addr = addr_str
+            .trim()
+            .parse()
+            .map_err(|_| Nat64NspError(format!("prefix is not an IPv6 address: `{addr_str}`")))?;
+        Self::new(addr, prefix_len)
+    }
+
+    /// Build an NSP from a prefix address + length, masking off the host bits. Rejects a length that is
+    /// not an RFC 6052 §2.2 embedding length.
+    pub fn new(prefix: Ipv6Addr, prefix_len: u8) -> Result<Self, Nat64NspError> {
+        if !Self::VALID_LENGTHS.contains(&prefix_len) {
+            return Err(Nat64NspError(format!(
+                "prefix length /{prefix_len} is not an RFC 6052 §2.2 embedding length (one of 32/40/48/56/64/96)"
+            )));
+        }
+        let masked = mask_segments(prefix.segments(), prefix_len);
+        Ok(Self { masked, prefix_len })
+    }
+
+    /// If `segments` falls under this NSP, decode + return the embedded IPv4 (RFC 6052 §2.2). `None`
+    /// when the address is not under this prefix.
+    fn embedded_v4(&self, segments: &[u16; 8]) -> Option<Ipv4Addr> {
+        if mask_segments(*segments, self.prefix_len) != self.masked {
+            return None;
+        }
+        Some(decode_embedded_v4(segments, self.prefix_len))
+    }
+}
+
+/// Mask an IPv6 segment array to its top `prefix_len` bits, zeroing the rest. Used so an NSP compares
+/// + matches exactly regardless of host-bit spelling.
+fn mask_segments(mut segments: [u16; 8], prefix_len: u8) -> [u16; 8] {
+    let mut bits_remaining = prefix_len as i32;
+    for seg in segments.iter_mut() {
+        if bits_remaining >= 16 {
+            bits_remaining -= 16;
+        } else if bits_remaining <= 0 {
+            *seg = 0;
+        } else {
+            let keep = bits_remaining as u32;
+            let mask: u16 = (!0u16) << (16 - keep);
+            *seg &= mask;
+            bits_remaining = 0;
+        }
+    }
+    segments
+}
+
+/// Decode the IPv4 embedded by an RFC 6052 §2.2 NAT64 prefix of the given length. The 32-bit v4 is laid
+/// out STARTING at `prefix_len` and SKIPPING bits 64–71 (the reserved "u" octet, which is always zero),
+/// per the RFC's table. We read it bit-exactly out of the 128-bit address so every defined length
+/// (`/32../96`) decodes correctly, including the `u`-octet straddle (e.g. `/40../56`).
+fn decode_embedded_v4(segments: &[u16; 8], prefix_len: u8) -> Ipv4Addr {
+    let bits = ((segments[0] as u128) << 112)
+        | ((segments[1] as u128) << 96)
+        | ((segments[2] as u128) << 80)
+        | ((segments[3] as u128) << 64)
+        | ((segments[4] as u128) << 48)
+        | ((segments[5] as u128) << 32)
+        | ((segments[6] as u128) << 16)
+        | (segments[7] as u128);
+    // Read 32 v4 bits starting at `prefix_len`, skipping the reserved bits 64..72.
+    let mut v4: u32 = 0;
+    let mut taken = 0u32;
+    let mut pos = prefix_len as u32;
+    while taken < 32 {
+        if (64..72).contains(&pos) {
+            pos = 72; // skip the reserved "u" octet (RFC 6052 §2.2)
+            continue;
+        }
+        let bit = ((bits >> (127 - pos)) & 1) as u32;
+        v4 = (v4 << 1) | bit;
+        taken += 1;
+        pos += 1;
+    }
+    Ipv4Addr::from(v4)
+}
+
+/// The classifier's NAT64 policy: the operator-configured NSP allowlist (default empty = OFF). The
+/// IANA well-known `64:ff9b::/96` is ALWAYS decoded regardless of this list (it is part of the strict
+/// baseline); this list adds operator-specific prefixes. Mirrors the `allow_loopback` config seam:
+/// default-OFF, opt-in only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Nat64Policy {
+    nsps: Vec<Nat64Nsp>,
+}
+
+impl Nat64Policy {
+    /// The default strict policy: no operator NSPs configured (only the well-known `/96` is decoded).
+    pub fn strict() -> Self {
+        Self::default()
+    }
+
+    /// Build a policy from already-parsed NSPs.
+    pub fn with_nsps(nsps: Vec<Nat64Nsp>) -> Self {
+        Self { nsps }
+    }
+
+    /// Parse a policy from a list of `<ipv6>/<len>` CIDR strings (operator config). An empty list
+    /// yields the strict default. Any malformed entry fails the whole parse (fail-closed config).
+    pub fn from_cidrs<I, S>(cidrs: I) -> Result<Self, Nat64NspError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        let nsps = cidrs
+            .into_iter()
+            .map(|c| Nat64Nsp::parse(c.as_ref()))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { nsps })
+    }
+
+    /// Whether any operator NSP is configured.
+    pub fn is_empty(&self) -> bool {
+        self.nsps.is_empty()
+    }
+
+    /// If `segments` falls under a configured NSP, decode + return the embedded v4. The first matching
+    /// NSP wins (operators should not configure overlapping prefixes). `None` ⇒ no configured NSP
+    /// matches, so the caller keeps the strict (well-known-/96-only) classification.
+    fn embedded_v4(&self, segments: &[u16; 8]) -> Option<Ipv4Addr> {
+        self.nsps.iter().find_map(|nsp| nsp.embedded_v4(segments))
+    }
+}
+
 /// Classify an IPv4/IPv6 literal as public. Returns `false` for any non-public range, malformed
 /// input, or a non-IP string. `allow_loopback` re-permits loopback (127/8, ::1, mapped 127.x) only.
 /// Mirrors `isPublicAddress`.
+///
+/// This uses the STRICT NAT64 policy (only the IANA well-known `64:ff9b::/96` is decoded). To honour
+/// an operator-configured NAT64 NSP allowlist, use [`is_public_address_with_nat64`].
 pub fn is_public_address(address: &str, allow_loopback: bool) -> bool {
+    is_public_address_with_nat64(address, allow_loopback, &Nat64Policy::strict())
+}
+
+/// Classify an IPv4/IPv6 literal as public, honouring an operator-configured NAT64 NSP allowlist (in
+/// addition to the always-on well-known `/96`). For a v6 address under a configured NSP the embedded
+/// IPv4 is decoded and classified on; an unmatched address keeps its raw-IPv6 classification
+/// (fail-closed). With [`Nat64Policy::strict`] (the default), behaviour is identical to
+/// [`is_public_address`].
+pub fn is_public_address_with_nat64(
+    address: &str,
+    allow_loopback: bool,
+    nat64: &Nat64Policy,
+) -> bool {
     if let Ok(v4) = address.parse::<Ipv4Addr>() {
         return is_public_ipv4(v4, allow_loopback);
     }
     if let Ok(v6) = address.parse::<Ipv6Addr>() {
-        return is_public_ipv6(v6, allow_loopback);
+        return is_public_ipv6(v6, allow_loopback, nat64);
     }
     false
 }
@@ -94,7 +286,7 @@ fn is_public_ipv4(addr: Ipv4Addr, allow_loopback: bool) -> bool {
     true
 }
 
-fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
+fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool, nat64: &Nat64Policy) -> bool {
     // Loopback ::1
     if addr == Ipv6Addr::LOCALHOST {
         return allow_loopback;
@@ -158,15 +350,31 @@ fn is_public_ipv6(addr: Ipv6Addr, allow_loopback: bool) -> bool {
     // known value, so this check is exact and cannot over-block.
     //
     // Operator-defined Network-Specific Prefixes (NSPs) at the shorter §2.2 lengths
-    // (/32../64) are deliberately NOT speculatively matched. We do not know the operator's NSP, and
+    // (/32../64) are deliberately NOT *speculatively* matched. We do not know the operator's NSP, and
     // RFC 6052 §2.2's only structural invariants (a zero reserved "u" octet + a zero suffix) are
     // ALSO satisfied by ordinary sparse global-unicast IPv6 allocations — so reading a candidate
     // v4 out of every such address would FALSE-BLOCK legitimate IPv6 whose interpreted candidate
     // merely happens to land in a private range (e.g. `2001:db8:a00:1::`, a valid global address,
     // would be read as embedding 10.0.0.1 under the /32 framing). The SSRF guard must never refuse
-    // a legitimate public address, so we check only the well-known /96. An operator running a
-    // custom NSP is responsible for its own egress policy.
+    // a legitimate public address, so by default we check only the well-known /96. An operator that
+    // KNOWS it runs a custom NSP can opt in to decoding it via the `nat64` policy (handled below),
+    // which is exact for that operator's configured prefix and so cannot over-block.
     if let Some(v4) = nat64_well_known_embedded_v4(&segments) {
+        // The well-known prefix is fixed + globally known, so this is exact + terminal: classify
+        // strictly on the embedded v4 (it cannot also be an operator NSP).
+        return is_public_ipv4(v4, allow_loopback);
+    }
+
+    // OPERATOR-CONFIGURED NAT64 NSP allowlist (opt-in, default-OFF). The strict default policy is
+    // empty, so this is a no-op unless an operator has supplied one or more NSPs — preserving the
+    // pre-allowlist behaviour exactly. For an address that falls under a configured NSP we decode the
+    // embedded v4 (RFC 6052 §2.2) and classify on it, so an embedded private/loopback/link-local v4
+    // is rejected. An address that matches NO configured NSP (and not the well-known /96) keeps its
+    // raw-IPv6 classification below — fail-closed, no silent allow. Note the asymmetry that makes this
+    // safe: a matched NSP can only ever cause a REJECT here (a public embedded v4 still had to pass the
+    // full IPv4 classifier and then we fall through to `true` exactly as a non-NAT64 v6 would), so a
+    // misconfigured NSP can never widen what is accepted beyond the raw-IPv6 verdict.
+    if let Some(v4) = nat64.embedded_v4(&segments) {
         if !is_public_ipv4(v4, allow_loopback) {
             return false;
         }
@@ -361,5 +569,214 @@ mod tests {
         assert!(is_loopback_address("::ffff:127.0.0.1"));
         assert!(!is_loopback_address("10.0.0.1"));
         assert!(!is_loopback_address("::ffff:8.8.8.8"));
+    }
+
+    // ============================================================================================
+    // Operator-configured NAT64 NSP allowlist (opt-in, default-OFF).
+    // ============================================================================================
+
+    #[test]
+    fn nsp_parse_accepts_valid_lengths_and_masks_host_bits() {
+        // All RFC 6052 §2.2 embedding lengths parse.
+        for len in [32u8, 40, 48, 56, 64, 96] {
+            assert!(
+                Nat64Nsp::parse(&format!("2001:db8::/{len}")).is_ok(),
+                "/{len} should be a valid NSP length"
+            );
+        }
+        // Two equivalent CIDRs (host bits set vs cleared) compare equal after masking.
+        let a = Nat64Nsp::parse("2001:db8::/32").unwrap();
+        let b = Nat64Nsp::parse("2001:db8:dead:beef::/32").unwrap();
+        assert_eq!(a, b, "host bits below the prefix must be masked off");
+    }
+
+    #[test]
+    fn nsp_parse_rejects_bad_input() {
+        // A length RFC 6052 §2.2 does not define for embedding.
+        assert!(Nat64Nsp::parse("2001:db8::/64x").is_err()); // not a number
+        assert!(Nat64Nsp::parse("2001:db8::/33").is_err()); // not an embedding length
+        assert!(Nat64Nsp::parse("2001:db8::/128").is_err()); // host route, not an NSP
+        assert!(Nat64Nsp::parse("not-an-ip/32").is_err()); // bad prefix
+        assert!(Nat64Nsp::parse("2001:db8::").is_err()); // missing /len
+                                                         // An IPv4 prefix is not an IPv6 NSP.
+        assert!(Nat64Nsp::parse("10.0.0.0/32").is_err());
+    }
+
+    #[test]
+    fn policy_from_cidrs_is_all_or_nothing() {
+        // A clean list parses.
+        assert!(Nat64Policy::from_cidrs(["2001:db8::/32", "2001:db8:1::/48"]).is_ok());
+        // One bad entry fails the whole parse (fail-closed config).
+        assert!(Nat64Policy::from_cidrs(["2001:db8::/32", "garbage"]).is_err());
+        // Empty list = strict default.
+        assert!(Nat64Policy::from_cidrs(Vec::<String>::new())
+            .unwrap()
+            .is_empty());
+    }
+
+    /// `<nsp-prefix-of-len>` embedding `v4`, returned as an IPv6 string. Built by composing the masked
+    /// prefix bits with the embedded v4 at the RFC 6052 §2.2 offsets — symmetric with the decoder, so a
+    /// round-trip (`embed → classify`) exercises the real bit layout.
+    fn embed_nat64(prefix: &str, prefix_len: u8, v4: Ipv4Addr) -> String {
+        let p: Ipv6Addr = prefix.parse().unwrap();
+        let pbits: u128 = u128::from(p);
+        let v4n = u32::from(v4);
+        let mut bits = pbits & (u128::MAX << (128 - prefix_len)); // keep only prefix bits
+                                                                  // Write 32 v4 bits starting at prefix_len, skipping bits 64..72 (reserved "u").
+        let mut taken = 0u32;
+        let mut pos = prefix_len as u32;
+        while taken < 32 {
+            if (64..72).contains(&pos) {
+                pos = 72;
+                continue;
+            }
+            let bit = ((v4n >> (31 - taken)) & 1) as u128;
+            bits |= bit << (127 - pos);
+            taken += 1;
+            pos += 1;
+        }
+        Ipv6Addr::from(bits).to_string()
+    }
+
+    #[test]
+    fn default_off_unchanged_for_nsp_shaped_addresses() {
+        // With NO operator NSP configured, an address under a hypothetical NSP that embeds a PRIVATE
+        // v4 must STILL be classified PUBLIC (the pre-allowlist behaviour) — the SSRF guard never
+        // speculatively decodes an operator prefix it wasn't told about.
+        let private_embed = embed_nat64("2001:db8::", 32, Ipv4Addr::new(10, 0, 0, 1));
+        assert!(
+            is_public_address(&private_embed, false),
+            "default (no NSP configured) must keep raw-IPv6 classification: {private_embed}"
+        );
+        // The strict policy passed explicitly is identical to the default.
+        assert!(is_public_address_with_nat64(
+            &private_embed,
+            false,
+            &Nat64Policy::strict()
+        ));
+    }
+
+    #[test]
+    fn configured_nsp_rejects_embedded_private_v4_at_every_length() {
+        // The core fix: when the operator configures their NSP, an embedded private/loopback/
+        // link-local v4 is decoded and REJECTED — at every RFC 6052 §2.2 embedding length.
+        let private_v4s = [
+            Ipv4Addr::new(10, 0, 0, 1),        // RFC 1918
+            Ipv4Addr::new(192, 168, 1, 1),     // RFC 1918
+            Ipv4Addr::new(169, 254, 169, 254), // link-local metadata
+            Ipv4Addr::new(127, 0, 0, 1),       // loopback
+            Ipv4Addr::new(100, 64, 0, 1),      // CGNAT
+        ];
+        for len in [32u8, 40, 48, 56, 64, 96] {
+            let policy = Nat64Policy::from_cidrs([format!("2001:db8::/{len}")]).unwrap();
+            for v4 in private_v4s {
+                let addr = embed_nat64("2001:db8::", len, v4);
+                assert!(
+                    !is_public_address_with_nat64(&addr, false, &policy),
+                    "/{len} NSP embedding private {v4} must be REJECTED: {addr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn configured_nsp_allows_embedded_public_v4_only_when_configured() {
+        // An embedded PUBLIC v4 under a configured NSP is allowed. Under no NSP it's also allowed (the
+        // raw-IPv6 verdict) — so the observable difference of configuring an NSP is ONLY the ability to
+        // REJECT an embedded private v4, never to widen acceptance. Verify both halves.
+        let public_embed = embed_nat64("2001:db8::", 48, Ipv4Addr::new(8, 8, 8, 8));
+        let policy = Nat64Policy::from_cidrs(["2001:db8::/48"]).unwrap();
+        assert!(
+            is_public_address_with_nat64(&public_embed, false, &policy),
+            "configured NSP embedding a public v4 → allowed: {public_embed}"
+        );
+        // Default-off: same address is also public (raw-IPv6 classification, no NSP decode).
+        assert!(is_public_address(&public_embed, false));
+
+        // And the discriminating case the task calls out: the SAME private-embedding address is
+        // ALLOWED when the NSP is NOT configured but REJECTED once it is.
+        let private_embed = embed_nat64("2001:db8::", 48, Ipv4Addr::new(192, 168, 0, 5));
+        assert!(
+            is_public_address(&private_embed, false),
+            "no NSP configured → allowed (raw IPv6)"
+        );
+        assert!(
+            !is_public_address_with_nat64(&private_embed, false, &policy),
+            "NSP configured → rejected (embedded private v4)"
+        );
+    }
+
+    #[test]
+    fn configured_nsp_does_not_affect_addresses_outside_it() {
+        // An NSP only matches addresses UNDER its prefix; a different global IPv6 keeps its raw verdict.
+        let policy = Nat64Policy::from_cidrs(["2001:db8:abcd::/48"]).unwrap();
+        // A genuine public address that does NOT fall under the configured NSP stays public.
+        assert!(is_public_address_with_nat64(
+            "2606:4700:4700::1111",
+            false,
+            &policy
+        ));
+        // An address under a DIFFERENT 2001:db8 sub-prefix (not the configured one) keeps its raw
+        // classification (public), not decoded — fail-closed, no over-match.
+        let other = embed_nat64("2001:db8:0001::", 48, Ipv4Addr::new(10, 0, 0, 1));
+        assert!(
+            is_public_address_with_nat64(&other, false, &policy),
+            "address outside the configured NSP must not be decoded: {other}"
+        );
+    }
+
+    #[test]
+    fn well_known_prefix_still_decoded_regardless_of_policy() {
+        // The IANA well-known 64:ff9b::/96 is ALWAYS decoded, even with an empty operator policy and
+        // even when the operator policy lists unrelated prefixes — the strict baseline is preserved.
+        let strict = Nat64Policy::strict();
+        assert!(!is_public_address_with_nat64(
+            "64:ff9b::a00:1",
+            false,
+            &strict
+        )); // 10.0.0.1
+        assert!(is_public_address_with_nat64(
+            "64:ff9b::808:808",
+            false,
+            &strict
+        )); // 8.8.8.8
+        let unrelated = Nat64Policy::from_cidrs(["2001:db8::/32"]).unwrap();
+        assert!(!is_public_address_with_nat64(
+            "64:ff9b::a9fe:a9fe",
+            false,
+            &unrelated
+        )); // 169.254.169.254
+    }
+
+    #[test]
+    fn multiple_nsps_first_match_wins_and_each_is_honoured() {
+        let policy = Nat64Policy::from_cidrs(["2001:db8:1::/48", "2001:db8:2::/48"]).unwrap();
+        // Each configured NSP independently rejects an embedded private v4.
+        assert!(!is_public_address_with_nat64(
+            &embed_nat64("2001:db8:1::", 48, Ipv4Addr::new(10, 0, 0, 1)),
+            false,
+            &policy
+        ));
+        assert!(!is_public_address_with_nat64(
+            &embed_nat64("2001:db8:2::", 48, Ipv4Addr::new(192, 168, 0, 1)),
+            false,
+            &policy
+        ));
+    }
+
+    #[test]
+    fn embed_helper_round_trips_via_decoder() {
+        // Sanity: the test's embed helper and the production decoder are inverses, so the above tests
+        // exercise the real bit layout rather than a self-consistent fiction.
+        for len in [32u8, 40, 48, 56, 64, 96] {
+            let v4 = Ipv4Addr::new(192, 0, 2, 33); // RFC 6052 §2.4 canonical example
+            let addr: Ipv6Addr = embed_nat64("2001:db8::", len, v4).parse().unwrap();
+            let nsp = Nat64Nsp::parse(&format!("2001:db8::/{len}")).unwrap();
+            assert_eq!(
+                nsp.embedded_v4(&addr.segments()),
+                Some(v4),
+                "/{len} embed→decode round-trip"
+            );
+        }
     }
 }
