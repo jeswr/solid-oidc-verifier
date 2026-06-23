@@ -8,10 +8,11 @@
 //! capacity exhaustion — rejects the request rather than silently weakening replay protection; the
 //! verifier maps it to a 503).
 //!
-//! The per-entry TTL MUST cover the full window the proof's `iat` would still be accepted
-//! (`DPOP_PROOF_MAX_AGE_SEC` + clock tolerance), else a captured proof could be replayed after the
-//! store forgot its `jti` but before the freshness check rejects it. The verifier always marks with
-//! exactly that window.
+//! The per-entry TTL MUST cover the full window the proof's `iat` would still be accepted, else a
+//! captured proof could be replayed after the store forgot its `jti` but before the freshness check
+//! rejects it. Because the freshness check is SYMMETRIC (`|now - iat| <= max_age + tolerance`), a
+//! future-skewed-but-accepted proof stays replayable for `2 × (max_age + tolerance)` — so the verifier
+//! marks with that full window (see [`crate::config::VerifierConfig::replay_ttl`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -169,6 +170,32 @@ mod tests {
             store.mark("e", Duration::from_millis(20)).unwrap(),
             MarkResult::New
         );
+    }
+
+    #[test]
+    fn jti_remembered_for_the_full_ttl_window() {
+        // The replay-TTL fix in numbers, scaled to ms. The verifier marks with TTL =
+        // `2 × (max_age + tolerance)` (the FULL symmetric acceptance window). A future-skewed proof
+        // accepted now stays replayable across that whole span, so the `jti` MUST remain marked for it.
+        //
+        // Here the full window is 120ms; the OLD (buggy) one-sided TTL would have been 60ms. We mark,
+        // sleep PAST the old 60ms horizon (where the bug forgot the jti, reopening the window), and
+        // assert the jti is STILL a replay — then sleep past the full 120ms window and assert it is
+        // forgotten. A mutation reverting the TTL to the one-sided value makes the mid-window replay a
+        // false `New` and fails this test.
+        let full_window = Duration::from_millis(120);
+        let store = InMemoryReplayStore::with_window(full_window);
+        assert_eq!(store.mark("f", full_window).unwrap(), MarkResult::New);
+        // Past the OLD one-sided horizon (60ms) but inside the full window (120ms): still a replay.
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            store.mark("f", full_window).unwrap(),
+            MarkResult::Replay,
+            "the jti must still be remembered past the one-sided window — the replay-TTL hole"
+        );
+        // Past the full window: forgotten (the proof's own iat freshness check now rejects it anyway).
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(store.mark("f", full_window).unwrap(), MarkResult::New);
     }
 
     #[test]

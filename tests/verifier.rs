@@ -1276,6 +1276,129 @@ fn rejects_future_proof_iat() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// Replay-TTL hole (the symmetric iat window + the full-window replay TTL)
+// ---------------------------------------------------------------------------------------------
+
+/// The freshness window is SYMMETRIC, so a proof skewed into the FUTURE by up to
+/// `max_age + tolerance` (here ~290s, comfortably inside the 305s window) is ACCEPTED. This is the
+/// case the Solid CTH exercises (a future-skewed proof the symmetric window must accept) — the reason
+/// the fix WIDENS the replay TTL rather than tightening the iat future bound.
+#[test]
+fn accepts_future_skewed_proof_within_symmetric_window() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    // +290s is within `max_age + tolerance` (300 + 5 = 305) → accepted.
+    let future = now_for_test() + 290;
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            iat: Some(future),
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    let out = v
+        .verify(&AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+        })
+        .expect("a future-skewed proof inside the symmetric window must be accepted");
+    assert_eq!(out.web_id.as_deref(), Some(WEBID));
+}
+
+/// The core of the replay-TTL fix, end-to-end: a future-skewed proof is accepted, and replaying that
+/// SAME proof is rejected — i.e. its `jti` is recorded even though its `iat` is in the future. Because
+/// such a proof stays acceptable for ~`2 × (max_age + tolerance)`, the replay store's TTL covers that
+/// full span (see `VerifierConfig::replay_ttl` + the `replay.rs` window test); here we prove the `jti`
+/// IS captured for a future-skewed proof — the precondition the widened TTL then keeps live.
+#[test]
+fn future_skewed_proof_jti_is_recorded_and_replay_rejected() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    let future = now_for_test() + 290; // accepted (inside the symmetric window)
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            iat: Some(future),
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    let req = AuthRequest {
+        authorization: Some(format!("DPoP {token}")),
+        dpop: Some(proof),
+        method: METHOD.into(),
+        url: URL.into(),
+    };
+    v.verify(&req)
+        .expect("first use of the future-skewed proof must be accepted");
+    // The exact same future-skewed proof again → replay (its jti was recorded despite the future iat).
+    assert_401(&v, &req, "replay");
+}
+
+/// Boundary coverage of the symmetric window: a proof at `+(max_age + tolerance)` is at the inclusive
+/// edge (accepted), while `+(max_age + tolerance + slack)` is past it (rejected). Pins the window so a
+/// mutation widening/narrowing the bound is caught. A small `slack` absorbs the 1s wall-clock tick.
+#[test]
+fn symmetric_window_future_boundary() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let mk = |iat: i64| {
+        let token = mint_access_token(
+            &issuer,
+            &TokenOpts {
+                cnf_jkt: Some(client.thumbprint.clone()),
+                ..Default::default()
+            },
+        );
+        let proof = mint_dpop_proof(
+            &client,
+            METHOD,
+            URL,
+            &ProofOpts {
+                iat: Some(iat),
+                access_token: Some(token.clone()),
+                ..Default::default()
+            },
+        );
+        AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+        }
+    };
+    // Just inside the +305s edge (use 300 to stay clear of the 1s wall-clock tick) → accepted.
+    v.verify(&mk(now_for_test() + 300))
+        .expect("a proof just inside the future edge must be accepted");
+    // Well past the +305s edge → rejected.
+    assert_401(&v, &mk(now_for_test() + 360), "recent enough");
+}
+
 #[test]
 fn rejects_wrong_proof_typ() {
     let issuer = KeyKit::generate();
@@ -1489,7 +1612,7 @@ const LEAKY_JWKS_DETAIL: &str =
 
 struct FailingProvider;
 impl JwksProvider for FailingProvider {
-    fn keys_for(&self, _issuer: &str) -> Result<Vec<Jwk>, JwksError> {
+    fn keys_for(&self, _issuer: &str) -> Result<std::sync::Arc<[Jwk]>, JwksError> {
         Err(JwksError(LEAKY_JWKS_DETAIL.into()))
     }
 }

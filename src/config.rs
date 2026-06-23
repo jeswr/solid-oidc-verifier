@@ -14,8 +14,10 @@ use std::time::Duration;
 use crate::jwk::Jwk;
 use crate::webid::{BidirectionalMode, WebIdResolver};
 
-/// The DPoP-proof `iat` freshness window the verifier enforces (TS `DPOP_PROOF_MAX_AGE_SEC`). The
-/// replay-cache TTL must cover this + the clock tolerance.
+/// The DPoP-proof `iat` freshness half-width (seconds) the verifier enforces (TS
+/// `DPOP_PROOF_MAX_AGE_SEC`). The freshness check is SYMMETRIC — `|now - iat| <= max_age + tolerance`
+/// — so a proof is accepted whether its `iat` is up to `max_age + tolerance` in the PAST or the
+/// FUTURE. The replay-cache TTL must therefore cover the FULL symmetric window (see [`VerifierConfig::replay_ttl`]).
 pub const DPOP_PROOF_MAX_AGE_SECS: u64 = 300;
 
 /// Default clock tolerance (seconds) for temporal claims (TS default `clockToleranceSec: 5`).
@@ -28,7 +30,11 @@ pub trait JwksProvider: Send + Sync {
     /// Return the candidate verification keys for `issuer`. The verifier has already confirmed
     /// `issuer` is in the trusted list before calling this, so a provider may assume trust. An error
     /// (e.g. discovery/JWKS fetch failure) maps to a 401 challenge, never a 500 (TS semantics).
-    fn keys_for(&self, issuer: &str) -> Result<Vec<Jwk>, JwksError>;
+    ///
+    /// Returns an `Arc<[Jwk]>` so a caching provider can hand out the cached set with a cheap
+    /// reference-count bump (`Arc::clone`) rather than deep-cloning the key `Vec` on every verify (the
+    /// per-request hot path). The returned slice derefs to `&[Jwk]` for the signature primitive.
+    fn keys_for(&self, issuer: &str) -> Result<Arc<[Jwk]>, JwksError>;
 }
 
 /// A JWKS-resolution failure (discovery unreachable, no jwks_uri, fetch failed, …). Surfaced to the
@@ -41,7 +47,7 @@ pub struct JwksError(pub String);
 /// that pre-provision the IdP's keys. The verifier still enforces the trusted-issuer allowlist, so an
 /// untrusted issuer never reaches this provider.
 pub struct StaticJwksProvider {
-    entries: std::collections::HashMap<String, Vec<Jwk>>,
+    entries: std::collections::HashMap<String, Arc<[Jwk]>>,
 }
 
 impl StaticJwksProvider {
@@ -52,7 +58,8 @@ impl StaticJwksProvider {
     }
 
     pub fn with_issuer(mut self, issuer: impl Into<String>, keys: Vec<Jwk>) -> Self {
-        self.entries.insert(issuer.into(), keys);
+        // Store as a shared slice so `keys_for` is an `Arc::clone` (refcount bump), not a deep clone.
+        self.entries.insert(issuer.into(), Arc::from(keys));
         self
     }
 }
@@ -64,10 +71,10 @@ impl Default for StaticJwksProvider {
 }
 
 impl JwksProvider for StaticJwksProvider {
-    fn keys_for(&self, issuer: &str) -> Result<Vec<Jwk>, JwksError> {
+    fn keys_for(&self, issuer: &str) -> Result<Arc<[Jwk]>, JwksError> {
         self.entries
             .get(issuer)
-            .cloned()
+            .map(Arc::clone)
             .ok_or_else(|| JwksError(format!("no JWKS configured for issuer {issuer}")))
     }
 }
@@ -117,10 +124,20 @@ impl VerifierConfig {
         }
     }
 
-    /// The replay-cache TTL window: max proof age + clock tolerance (TS invariant). Entries must live
-    /// at least this long so the replay window cannot reopen.
+    /// The replay-cache TTL window: it MUST cover the FULL span over which a given DPoP proof's `iat`
+    /// would still pass the freshness check, otherwise the store could forget a `jti` while the proof
+    /// is still acceptable — reopening a replay window.
+    ///
+    /// The freshness check is SYMMETRIC: `|now - iat| <= max_age + tolerance`. A proof minted with an
+    /// `iat` skewed up to `(max_age + tolerance)` into the FUTURE is therefore accepted *now* AND stays
+    /// acceptable until `now ≈ iat + (max_age + tolerance) ≈ initial_now + 2 × (max_age + tolerance)`.
+    /// So the TTL is `2 × (max_age + tolerance)` — twice the one-sided window — so a future-skewed (but
+    /// accepted) proof's `jti` is remembered for as long as that proof remains replayable. (A tighter
+    /// fix would clamp the `iat` FUTURE bound to `tolerance`, but the Solid CTH sends a future-skewed
+    /// proof the symmetric window must accept, so we widen the TTL — the conformance-preserving fix —
+    /// rather than tighten the acceptance window.)
     pub fn replay_ttl(&self) -> Duration {
-        Duration::from_secs(DPOP_PROOF_MAX_AGE_SECS + self.clock_tolerance_secs)
+        Duration::from_secs(2 * (DPOP_PROOF_MAX_AGE_SECS + self.clock_tolerance_secs))
     }
 
     /// Validate the configuration at construction (TS constructor invariants): ≥1 trusted issuer and a
@@ -205,11 +222,16 @@ pub struct ConfigError(pub String);
 ///
 /// The verifier only calls [`JwksProvider::keys_for`] for an *already-trusted* issuer (the allowlist is
 /// checked first), so discovery is never driven for an attacker-named issuer.
+/// A cached JWKS entry: the shared key slice + when it was fetched (for `cache_ttl` expiry). An
+/// `Arc<[Jwk]>` so a cache hit hands the keys out with a refcount bump, never a deep `Vec` clone.
+#[cfg(feature = "network")]
+type JwksCacheEntry = (Arc<[Jwk]>, std::time::Instant);
+
 #[cfg(feature = "network")]
 pub struct NetworkJwksProvider<R: crate::net::HostResolver = crate::net::SystemResolver> {
     fetcher: crate::net::SafeFetcher<R>,
-    /// issuer → (keys, fetched_at). A successful resolution is cached for `cache_ttl`.
-    cache: Mutex<std::collections::HashMap<String, (Vec<Jwk>, std::time::Instant)>>,
+    /// issuer → cached entry. A successful resolution is cached for `cache_ttl`.
+    cache: Mutex<std::collections::HashMap<String, JwksCacheEntry>>,
     cache_ttl: Duration,
 }
 
@@ -247,7 +269,7 @@ impl<R: crate::net::HostResolver> NetworkJwksProvider<R> {
     }
 
     /// Discover + fetch the issuer's JWKS over the SSRF-guarded path. Not cached (the caller caches).
-    fn fetch_keys(&self, issuer: &str) -> Result<Vec<Jwk>, JwksError> {
+    fn fetch_keys(&self, issuer: &str) -> Result<Arc<[Jwk]>, JwksError> {
         // OIDC discovery URL: <issuer>/.well-known/openid-configuration. We join carefully so an issuer
         // with or without a trailing slash both resolve to the sibling well-known path under the issuer
         // origin+path (matching how IdPs publish it). RFC 8414 also defines a host-rooted variant, but
@@ -284,8 +306,9 @@ impl<R: crate::net::HostResolver> NetworkJwksProvider<R> {
 
 #[cfg(feature = "network")]
 impl<R: crate::net::HostResolver> JwksProvider for NetworkJwksProvider<R> {
-    fn keys_for(&self, issuer: &str) -> Result<Vec<Jwk>, JwksError> {
-        // Serve from cache when fresh.
+    fn keys_for(&self, issuer: &str) -> Result<Arc<[Jwk]>, JwksError> {
+        // Serve from cache when fresh. `Arc::clone` is a refcount bump — the shared key slice is NOT
+        // deep-copied on the per-request hot path.
         {
             let cache = self
                 .cache
@@ -293,16 +316,17 @@ impl<R: crate::net::HostResolver> JwksProvider for NetworkJwksProvider<R> {
                 .map_err(|_| JwksError("JWKS cache mutex poisoned".into()))?;
             if let Some((keys, at)) = cache.get(issuer) {
                 if at.elapsed() < self.cache_ttl {
-                    return Ok(keys.clone());
+                    return Ok(Arc::clone(keys));
                 }
             }
         }
-        // Miss / stale → fetch over the SSRF-guarded path, then cache.
+        // Miss / stale → fetch over the SSRF-guarded path, then cache. Caching the `Arc` clone is again
+        // a refcount bump (the keys are shared, not copied, between the cache and the returned handle).
         let keys = self.fetch_keys(issuer)?;
         if let Ok(mut cache) = self.cache.lock() {
             cache.insert(
                 issuer.to_string(),
-                (keys.clone(), std::time::Instant::now()),
+                (Arc::clone(&keys), std::time::Instant::now()),
             );
         }
         Ok(keys)
@@ -331,7 +355,7 @@ fn join_well_known(issuer: &str) -> Option<String> {
 /// entry that is not a usable asymmetric key shape rather than failing the whole set. Bounds the key
 /// count (DoS guard against an enormous JWKS that passed the byte cap with tiny keys).
 #[cfg(feature = "network")]
-fn parse_jwks(body: &[u8]) -> Result<Vec<Jwk>, JwksError> {
+fn parse_jwks(body: &[u8]) -> Result<Arc<[Jwk]>, JwksError> {
     /// Upper bound on keys in a JWKS — far above any real IdP (Keycloak rotates 2–3).
     const MAX_KEYS: usize = 64;
     let doc: serde_json::Value =
@@ -359,7 +383,7 @@ fn parse_jwks(body: &[u8]) -> Result<Vec<Jwk>, JwksError> {
     if keys.is_empty() {
         return Err(JwksError("JWKS contained no usable public keys.".into()));
     }
-    Ok(keys)
+    Ok(Arc::from(keys))
 }
 
 #[cfg(test)]
@@ -379,15 +403,50 @@ mod tests {
     }
 
     #[test]
-    fn replay_ttl_covers_window() {
+    fn replay_ttl_covers_full_symmetric_window() {
+        // The replay TTL must cover the FULL span a proof's `iat` is acceptable. The freshness check is
+        // symmetric (`|now - iat| <= max_age + tolerance`), so a future-skewed-but-accepted proof stays
+        // replayable for `2 × (max_age + tolerance)` = `2 × 305` = 610s. The TTL must equal that.
         let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example");
-        assert_eq!(c.replay_ttl(), Duration::from_secs(305));
+        assert_eq!(c.replay_ttl(), Duration::from_secs(610));
+    }
+
+    #[test]
+    fn replay_ttl_tracks_clock_tolerance() {
+        // The TTL is `2 × (max_age + tolerance)` — it must scale with the configured tolerance so a
+        // larger skew allowance does NOT leave a forgotten-but-replayable window. tolerance=20 ⇒
+        // `2 × (300 + 20)` = 640s.
+        let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example")
+            .clock_tolerance_secs(20);
+        assert_eq!(c.replay_ttl(), Duration::from_secs(640));
     }
 
     #[test]
     fn static_provider_returns_keys_or_err() {
         let p = StaticJwksProvider::new();
         assert!(p.keys_for("https://x").is_err());
+    }
+
+    #[test]
+    fn static_provider_shares_one_arc_allocation_across_calls() {
+        // The perf change: `keys_for` hands out an `Arc<[Jwk]>` from the shared cache via `Arc::clone`
+        // (a refcount bump), NOT a deep clone of the key `Vec`. Two calls for the same issuer must
+        // therefore return Arcs pointing at the SAME allocation. A mutation that deep-clones (e.g.
+        // `Arc::from(keys.to_vec())` per call) makes `Arc::ptr_eq` false and fails this.
+        let key: Jwk = serde_json::from_value(serde_json::json!({
+            "kty": "EC", "crv": "P-256",
+            "x": "f83OJ3D2xF1Bg8vub9tLe1gHMzV76e8Tus9uPHvRVEU",
+            "y": "x_FEzRu9m36HLN_tue659LNpXW6pCyStikYjKIWI5a0"
+        }))
+        .unwrap();
+        let p = StaticJwksProvider::new().with_issuer("https://idp", vec![key]);
+        let a = p.keys_for("https://idp").unwrap();
+        let b = p.keys_for("https://idp").unwrap();
+        assert_eq!(a.len(), 1);
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "keys_for must share one Arc, not deep-clone"
+        );
     }
 
     #[cfg(feature = "network")]
