@@ -146,11 +146,18 @@ impl<C: Clock> InMemoryReplayStore<C> {
 
 impl<C: Clock> ReplayStore for InMemoryReplayStore<C> {
     fn mark(&self, jti: &str, ttl: Duration) -> Result<MarkResult, ReplayBackendError> {
-        let now = self.clock.now();
         let mut map = self
             .inner
             .lock()
             .map_err(|_| ReplayBackendError("replay store mutex poisoned".into()))?;
+        // Sample the clock AFTER acquiring the lock (same reasoning as `contains`): under lock
+        // contention a pre-lock `now` would be stale by the time the check-and-set runs, so an
+        // expired entry could be mis-read as still live (false `Replay`) and a freshly stored
+        // `now + ttl` expiry would be computed too early — shortening the retention window. Reading
+        // `now` here evaluates expiry, and anchors the new entry's window, against the time the store
+        // is actually mutated. (The check-and-set was already atomic under the lock; this only fixes
+        // the timestamp it is evaluated against.)
+        let now = self.clock.now();
 
         // An existing entry → replay if still live; if expired, treat as fresh and overwrite below.
         match map.get(jti) {
@@ -188,11 +195,18 @@ impl<C: Clock> ReplayStore for InMemoryReplayStore<C> {
         // probed entry. An expired entry reads as NOT contained (its `expiry > now` is false),
         // matching `mark`'s "an expired jti is fresh again" semantics; the dead entry is left for
         // `mark`'s at-capacity prune to reap, so `contains` has zero side effects.
-        let now = self.clock.now();
+        //
+        // Sample the clock AFTER acquiring the lock so expiry is evaluated against the time the store
+        // is ACTUALLY read, not when the call began. If `now` were read before the lock, a caller that
+        // blocked on lock contention past an entry's expiry would compare against a STALE timestamp and
+        // could report `true` for a `jti` that has already expired by the time the read happens —
+        // violating the "expired reads as false" semantics and causing a spurious false-positive replay
+        // rejection of a legitimate request.
         let map = self
             .inner
             .lock()
             .map_err(|_| ReplayBackendError("replay store mutex poisoned".into()))?;
+        let now = self.clock.now();
         Ok(matches!(map.get(jti), Some(&expiry) if expiry > now))
     }
 }
@@ -521,6 +535,50 @@ mod tests {
         );
         // After the storm, the jti is contained exactly once-and-for-all.
         assert!(store.contains("c-race").unwrap());
+    }
+
+    #[test]
+    fn contains_samples_clock_after_lock_so_expiry_under_contention_reads_false() {
+        use std::sync::Arc;
+        // Pins the stale-now fix: `contains()` MUST sample the clock AFTER acquiring the mutex, so an
+        // entry that expires WHILE the prober is blocked on lock contention reads as `false` (not a
+        // spurious false-positive replay). We reproduce "blocked past expiry" deterministically: the
+        // test thread holds the store's lock, the prober thread calls `contains()` and parks on
+        // `inner.lock()`, we advance the fake clock past the entry's expiry WHILE it is parked, then
+        // release the lock. Because `now` is read after the lock is acquired, the prober evaluates
+        // expiry against the ADVANCED (post-expiry) time → `false`.
+        //
+        // Mutation-check: revert the fix (read `now` before `inner.lock()`) and the prober samples the
+        // pre-advance time (still within the window) → `true` → this assertion fails.
+        let clock = Arc::new(FakeClock::new());
+        let store = Arc::new(store_with(100_000, Arc::clone(&clock)));
+        let ttl = Duration::from_secs(20);
+        assert_eq!(store.mark("contended", ttl).unwrap(), MarkResult::New);
+        assert!(
+            store.contains("contended").unwrap(),
+            "the entry is live before any contention"
+        );
+
+        // Hold the store's lock so the prober must block on `inner.lock()`.
+        let guard = store.inner.lock().unwrap();
+
+        let probe_store = Arc::clone(&store);
+        let prober = std::thread::spawn(move || probe_store.contains("contended").unwrap());
+
+        // Give the prober time to actually reach (and park on) `inner.lock()`. Then advance the clock
+        // PAST the entry's expiry — simulating the wall-clock moving on while the call is blocked.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        clock.advance(Duration::from_secs(60));
+
+        // Release the lock; the prober now acquires it and (post-fix) samples the advanced clock.
+        drop(guard);
+
+        let observed = prober.join().unwrap();
+        assert!(
+            !observed,
+            "a contains() probe whose lock acquisition is delayed past the entry's expiry must read \
+             false — the clock is sampled after the lock, not before"
+        );
     }
 
     /// A fail-closed test stub: a store that always errors. The verifier turns this into a 503.
