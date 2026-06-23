@@ -131,13 +131,24 @@ impl VerifierConfig {
     /// The freshness check is SYMMETRIC: `|now - iat| <= max_age + tolerance`. A proof minted with an
     /// `iat` skewed up to `(max_age + tolerance)` into the FUTURE is therefore accepted *now* AND stays
     /// acceptable until `now ≈ iat + (max_age + tolerance) ≈ initial_now + 2 × (max_age + tolerance)`.
-    /// So the TTL is `2 × (max_age + tolerance)` — twice the one-sided window — so a future-skewed (but
-    /// accepted) proof's `jti` is remembered for as long as that proof remains replayable. (A tighter
-    /// fix would clamp the `iat` FUTURE bound to `tolerance`, but the Solid CTH sends a future-skewed
-    /// proof the symmetric window must accept, so we widen the TTL — the conformance-preserving fix —
-    /// rather than tighten the acceptance window.)
+    /// So the *nominal* window is `2 × (max_age + tolerance)` — twice the one-sided window.
+    ///
+    /// **The +1s safety margin.** The freshness check runs on INTEGER seconds (`now_secs()` truncated)
+    /// with an INCLUSIVE `<=` boundary, while the replay entry expires at `mark_instant + ttl` measured
+    /// on the sub-second monotonic `Instant` clock. A proof first marked partway through integer second
+    /// `N` (so its `Instant` is already past the start of second `N`) stays *acceptable* for the WHOLE
+    /// of integer second `N + 2×(max_age+tolerance)` (the `<=` boundary is inclusive of the entire final
+    /// second), i.e. until wall-clock ≈ `start_of_second(N) + 2×window + 1`. The entry, however, would
+    /// expire at `mark_instant + 2×window < start_of_second(N) + 2×window + 1`, leaving up to ~1s where
+    /// the proof is still ACCEPTED but its `jti` is already FORGOTTEN — a replay slips through. Adding a
+    /// **+1 second** margin makes the TTL cover the full inclusive integer-second acceptance window with
+    /// no gap (the entry now outlives the last acceptable instant for any sub-second mark offset).
+    ///
+    /// (A tighter fix would clamp the `iat` FUTURE bound to `tolerance`, but the Solid CTH sends a
+    /// future-skewed proof the symmetric window must accept, so we widen the TTL — the
+    /// conformance-preserving fix — rather than tighten the acceptance window.)
     pub fn replay_ttl(&self) -> Duration {
-        Duration::from_secs(2 * (DPOP_PROOF_MAX_AGE_SECS + self.clock_tolerance_secs))
+        Duration::from_secs(2 * (DPOP_PROOF_MAX_AGE_SECS + self.clock_tolerance_secs) + 1)
     }
 
     /// Validate the configuration at construction (TS constructor invariants): ≥1 trusted issuer and a
@@ -406,19 +417,80 @@ mod tests {
     fn replay_ttl_covers_full_symmetric_window() {
         // The replay TTL must cover the FULL span a proof's `iat` is acceptable. The freshness check is
         // symmetric (`|now - iat| <= max_age + tolerance`), so a future-skewed-but-accepted proof stays
-        // replayable for `2 × (max_age + tolerance)` = `2 × 305` = 610s. The TTL must equal that.
+        // replayable for `2 × (max_age + tolerance)` = `2 × 305` = 610s, PLUS a +1s margin for the
+        // integer-second/inclusive-boundary residual gap (see `replay_ttl` docs) → 611s.
         let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example");
-        assert_eq!(c.replay_ttl(), Duration::from_secs(610));
+        assert_eq!(c.replay_ttl(), Duration::from_secs(611));
     }
 
     #[test]
     fn replay_ttl_tracks_clock_tolerance() {
-        // The TTL is `2 × (max_age + tolerance)` — it must scale with the configured tolerance so a
+        // The TTL is `2 × (max_age + tolerance) + 1` — it must scale with the configured tolerance so a
         // larger skew allowance does NOT leave a forgotten-but-replayable window. tolerance=20 ⇒
-        // `2 × (300 + 20)` = 640s.
+        // `2 × (300 + 20) + 1` = 641s.
         let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example")
             .clock_tolerance_secs(20);
-        assert_eq!(c.replay_ttl(), Duration::from_secs(640));
+        assert_eq!(c.replay_ttl(), Duration::from_secs(641));
+    }
+
+    #[test]
+    fn replay_ttl_includes_the_one_second_inclusive_boundary_margin() {
+        // Pin the +1s margin EXPLICITLY: the TTL is strictly GREATER than the nominal
+        // `2 × (max_age + tolerance)`, by exactly one second. This guards against a regression that
+        // drops the margin back to the bare doubled window (reopening the residual ~1s replay gap).
+        for tol in [0u64, 5, 20, 100] {
+            let nominal = 2 * (DPOP_PROOF_MAX_AGE_SECS + tol);
+            let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example")
+                .clock_tolerance_secs(tol);
+            assert_eq!(
+                c.replay_ttl(),
+                Duration::from_secs(nominal + 1),
+                "replay_ttl must be 2×(max_age+tolerance)+1 (the inclusive-boundary safety margin)"
+            );
+            assert!(
+                c.replay_ttl() > Duration::from_secs(nominal),
+                "the TTL must strictly exceed the nominal doubled window"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_ttl_leaves_no_gap_at_the_latest_acceptable_instant() {
+        // BOUNDARY PROOF (Finding #1, no-gap): a proof accepted at the LATEST acceptable instant must
+        // have its `jti` remembered for the ENTIRE time it remains acceptable. We model the two clocks
+        // the live code actually uses:
+        //   * freshness check — INTEGER seconds, INCLUSIVE `<=`: accepted iff |now_secs - iat| <= window
+        //     (verifier.rs). `now_secs` is truncated to whole seconds.
+        //   * replay entry    — sub-second monotonic Instant, expires at `mark_instant + ttl`
+        //     (replay.rs). `mark_instant` falls somewhere inside the integer second of marking.
+        //
+        // Worst case for the gap: a MAX-future-skewed proof (`iat = mark_second + window`) marked at the
+        // very START of its integer second (sub-second offset → 0). It stays acceptable through the WHOLE
+        // of integer second `mark_second + 2*window` (the inclusive `<=` includes every fractional
+        // instant of that final second), i.e. up to wall-clock `mark_second_start + (2*window + 1)`. The
+        // replay entry must not expire before then.
+        for tol in [0u64, 5, 20] {
+            let c = VerifierConfig::new(vec!["https://idp".into()], "https://pod.example")
+                .clock_tolerance_secs(tol);
+            let window = (DPOP_PROOF_MAX_AGE_SECS + tol) as f64;
+            let ttl = c.replay_ttl().as_secs_f64();
+
+            // The latest wall-clock instant (relative to the start of the marking second) at which the
+            // freshness check still accepts the proof: the END of integer second `2*window` = `2*window + 1`.
+            let last_acceptable_offset = 2.0 * window + 1.0;
+
+            // The replay entry expires at `sub_second_mark_offset + ttl`. Sweep every realistic
+            // sub-second mark offset in [0, 1); the smallest expiry (offset → 0) is the tightest case.
+            for &mark_offset in &[0.0_f64, 0.001, 0.25, 0.5, 0.999_999] {
+                let expiry_offset = mark_offset + ttl;
+                assert!(
+                    expiry_offset >= last_acceptable_offset,
+                    "replay entry would expire (at +{expiry_offset}s) BEFORE the proof stops being \
+                     acceptable (at +{last_acceptable_offset}s) for mark_offset={mark_offset}, \
+                     tol={tol} — a replay gap. ttl={ttl}",
+                );
+            }
+        }
     }
 
     #[test]

@@ -318,11 +318,12 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
             _ => return Err(invalid_token_dpop("DPoP proof is missing a jti.")),
         }
         // iat — SYMMETRIC freshness window `|now - iat| <= max_age + tolerance` (tolerance either
-        // side). NB this one-sided half-width is `max_age + tolerance`; a future-skewed proof at the
-        // edge stays acceptable for ~2× that, which is exactly why `replay_ttl()` is `2 ×
-        // (max_age + tolerance)` (so the replay store does not forget a still-replayable `jti`). The
-        // Solid CTH sends a future-skewed proof the symmetric window must accept, so we keep the
-        // window symmetric and widen the TTL rather than tighten the future bound.
+        // side), on INTEGER seconds with an INCLUSIVE `<=` boundary. NB this one-sided half-width is
+        // `max_age + tolerance`; a future-skewed proof at the edge stays acceptable for ~2× that, which
+        // is exactly why `replay_ttl()` is `2 × (max_age + tolerance) + 1` — the doubled window plus a
+        // +1s inclusive-integer-second-boundary margin (so the replay store never forgets a
+        // still-replayable `jti`). The Solid CTH sends a future-skewed proof the symmetric window must
+        // accept, so we keep the window symmetric and widen the TTL rather than tighten the future bound.
         let iat = claims
             .get("iat")
             .and_then(Value::as_i64)

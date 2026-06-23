@@ -116,7 +116,9 @@ pub use error::{ErrorKind, VerifyError};
 pub use jwk::{Jwk, JwkError, ES512_KNOWN_NARROWING, SIGNING_ALGS};
 #[cfg(feature = "network")]
 pub use net::{HostResolver, SafeFetchConfig, SafeFetchError, SafeFetcher, SystemResolver};
-pub use replay::{InMemoryReplayStore, MarkResult, ReplayBackendError, ReplayStore};
+pub use replay::{
+    Clock, InMemoryReplayStore, MarkResult, MonotonicClock, ReplayBackendError, ReplayStore,
+};
 pub use ssrf::{
     is_loopback_address, is_public_address, is_public_address_with_nat64, Nat64Nsp, Nat64NspError,
     Nat64Policy,

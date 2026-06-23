@@ -11,12 +11,36 @@
 //! The per-entry TTL MUST cover the full window the proof's `iat` would still be accepted, else a
 //! captured proof could be replayed after the store forgot its `jti` but before the freshness check
 //! rejects it. Because the freshness check is SYMMETRIC (`|now - iat| <= max_age + tolerance`), a
-//! future-skewed-but-accepted proof stays replayable for `2 × (max_age + tolerance)` — so the verifier
-//! marks with that full window (see [`crate::config::VerifierConfig::replay_ttl`]).
+//! future-skewed-but-accepted proof stays replayable for `2 × (max_age + tolerance)` — and because that
+//! check runs on INCLUSIVE integer seconds while this store expires on the sub-second monotonic clock,
+//! the verifier marks with `2 × (max_age + tolerance) + 1` (the full window plus a +1s
+//! inclusive-boundary safety margin — see [`crate::config::VerifierConfig::replay_ttl`]).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// The monotonic time source the in-memory store reads. This is an advanced seam: the default store
+/// (`InMemoryReplayStore`) uses the real [`MonotonicClock`] (`Instant::now`), and you do NOT need to
+/// implement this in normal use. It exists so a deterministic, manually-advanced clock can be injected
+/// (e.g. in retention tests, avoiding scheduler-jitter-flaky sleeps). A MONOTONIC source is required —
+/// the store keeps absolute expiry instants and compares `expiry > now`; a clock that can jump
+/// backwards would be unsound here.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+}
+
+/// The production clock: the real monotonic `Instant::now()`. Zero-sized, no overhead. This is the
+/// default time source for [`InMemoryReplayStore`].
+#[derive(Default)]
+pub struct MonotonicClock;
+
+impl Clock for MonotonicClock {
+    #[inline]
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
 
 /// Whether a `jti` was newly recorded or had already been seen within its window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,26 +77,41 @@ pub trait ReplayStore: Send + Sync {
 /// (the proof's independent `iat` freshness bound re-rejects a genuinely stale proof). A strictly
 /// atomic check-and-set across *processes* is the M2 shared (Redis `SET NX`) impl; this is correct
 /// for one process.
-pub struct InMemoryReplayStore {
+pub struct InMemoryReplayStore<C: Clock = MonotonicClock> {
     inner: Mutex<HashMap<String, Instant>>,
     /// Live-entry cap, kept as `u64` for API stability (converted to `usize` internally). A NEW `jti`
     /// at capacity fails closed rather than evicting a live entry.
     max_entries: u64,
+    /// The monotonic time source. Production is [`MonotonicClock`]; tests inject a deterministic one.
+    clock: C,
 }
 
-impl InMemoryReplayStore {
+impl InMemoryReplayStore<MonotonicClock> {
     /// Build a store capped at `max_entries` live `jti`s. `ttl` is supplied per-mark (the verifier
     /// always uses `max_age + tolerance`), so no construction-time TTL is needed.
     pub fn new(max_entries: u64, _ttl: Duration) -> Self {
-        Self {
-            inner: Mutex::new(HashMap::new()),
-            max_entries,
-        }
+        Self::with_clock(max_entries, MonotonicClock)
     }
 
     /// Default cap (100_000, matching the TS default). `ttl` is accepted for API symmetry.
     pub fn with_window(ttl: Duration) -> Self {
         Self::new(100_000, ttl)
+    }
+}
+
+impl<C: Clock> InMemoryReplayStore<C> {
+    /// Build a store over an explicit [`Clock`]. The default constructors ([`Self::new`] /
+    /// [`Self::with_window`]) use the real [`MonotonicClock`]; this seam lets a deterministic,
+    /// manually-advanced clock be injected so retention/TTL-boundary assertions are not at the mercy
+    /// of CI scheduler jitter (and lets a downstream consumer drive expiry deterministically in its
+    /// own tests). A MONOTONIC clock is required — the store keeps absolute expiry instants and
+    /// compares `expiry > now`; a backwards-jumping clock would be unsound.
+    pub fn with_clock(max_entries: u64, clock: C) -> Self {
+        Self {
+            inner: Mutex::new(HashMap::new()),
+            max_entries,
+            clock,
+        }
     }
 
     /// The cap as a `usize` (saturating, so a `u64` larger than `usize::MAX` clamps rather than wraps).
@@ -87,9 +126,9 @@ impl InMemoryReplayStore {
     }
 }
 
-impl ReplayStore for InMemoryReplayStore {
+impl<C: Clock> ReplayStore for InMemoryReplayStore<C> {
     fn mark(&self, jti: &str, ttl: Duration) -> Result<MarkResult, ReplayBackendError> {
-        let now = Instant::now();
+        let now = self.clock.now();
         let mut map = self
             .inner
             .lock()
@@ -129,6 +168,52 @@ impl ReplayStore for InMemoryReplayStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// A deterministic, manually-advanced monotonic clock for retention tests. It reads a real base
+    /// `Instant` once at construction, then reports `base + offset`; `advance` bumps `offset` with no
+    /// sleeping. This removes ALL scheduler-jitter fragility from TTL-boundary assertions: time only
+    /// moves when the test moves it. (Monotonic-safe — offset only ever increases.)
+    struct FakeClock {
+        base: Instant,
+        offset: StdMutex<Duration>,
+    }
+
+    impl FakeClock {
+        fn new() -> Self {
+            Self {
+                base: Instant::now(),
+                offset: StdMutex::new(Duration::ZERO),
+            }
+        }
+        fn advance(&self, by: Duration) {
+            let mut o = self.offset.lock().unwrap();
+            *o += by;
+        }
+    }
+
+    impl Clock for FakeClock {
+        fn now(&self) -> Instant {
+            self.base + *self.offset.lock().unwrap()
+        }
+    }
+
+    /// Helper: build an in-memory store driven by a shared deterministic clock.
+    fn store_with(
+        max_entries: u64,
+        clock: std::sync::Arc<FakeClock>,
+    ) -> InMemoryReplayStore<ArcClock> {
+        InMemoryReplayStore::with_clock(max_entries, ArcClock(clock))
+    }
+
+    /// `Arc<FakeClock>` wrapper so the test can hold a handle to advance the clock while the store owns
+    /// its own `Clock`.
+    struct ArcClock(std::sync::Arc<FakeClock>);
+    impl Clock for ArcClock {
+        fn now(&self) -> Instant {
+            self.0.now()
+        }
+    }
 
     #[test]
     fn first_mark_is_new_second_is_replay() {
@@ -158,44 +243,67 @@ mod tests {
 
     #[test]
     fn expired_jti_is_fresh_again() {
-        let store = InMemoryReplayStore::with_window(Duration::from_millis(20));
-        assert_eq!(
-            store.mark("e", Duration::from_millis(20)).unwrap(),
-            MarkResult::New
-        );
-        std::thread::sleep(Duration::from_millis(60));
-        // The expired entry is treated as fresh (its window closed); the proof's own iat check
-        // independently rejects a genuinely stale proof.
-        assert_eq!(
-            store.mark("e", Duration::from_millis(20)).unwrap(),
-            MarkResult::New
-        );
+        // Deterministic (fake clock, no sleep): mark, advance well past the TTL, the entry is expired
+        // and treated as fresh again (its window closed); the proof's own iat check independently
+        // rejects a genuinely stale proof.
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let store = store_with(100_000, std::sync::Arc::clone(&clock));
+        let ttl = Duration::from_secs(20);
+        assert_eq!(store.mark("e", ttl).unwrap(), MarkResult::New);
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(store.mark("e", ttl).unwrap(), MarkResult::New);
     }
 
     #[test]
     fn jti_remembered_for_the_full_ttl_window() {
-        // The replay-TTL fix in numbers, scaled to ms. The verifier marks with TTL =
-        // `2 × (max_age + tolerance)` (the FULL symmetric acceptance window). A future-skewed proof
-        // accepted now stays replayable across that whole span, so the `jti` MUST remain marked for it.
+        // DETERMINISTIC retention test (Finding #2: no sleeps, no scheduler jitter). The verifier marks
+        // with the full replay TTL; a future-skewed proof accepted now stays replayable across that
+        // whole span, so the `jti` MUST remain marked for it. We drive a fake clock so time only moves
+        // when we move it — the TTL boundary is then exact, not "≈ a sleep that CI might overshoot".
         //
-        // Here the full window is 120ms; the OLD (buggy) one-sided TTL would have been 60ms. We mark,
-        // sleep PAST the old 60ms horizon (where the bug forgot the jti, reopening the window), and
-        // assert the jti is STILL a replay — then sleep past the full 120ms window and assert it is
-        // forgotten. A mutation reverting the TTL to the one-sided value makes the mid-window replay a
-        // false `New` and fails this test.
-        let full_window = Duration::from_millis(120);
-        let store = InMemoryReplayStore::with_window(full_window);
-        assert_eq!(store.mark("f", full_window).unwrap(), MarkResult::New);
-        // Past the OLD one-sided horizon (60ms) but inside the full window (120ms): still a replay.
-        std::thread::sleep(Duration::from_millis(80));
+        // Use a 100s TTL purely as a unit. The store remembers a jti while `expiry > now`, i.e. for
+        // strictly less than the TTL after marking. We assert: just before the boundary → Replay; just
+        // after → New (forgotten). A mutation shrinking the stored TTL makes the pre-boundary check a
+        // false `New` and fails the test.
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let store = store_with(100_000, std::sync::Arc::clone(&clock));
+        let ttl = Duration::from_secs(100);
+
+        assert_eq!(store.mark("f", ttl).unwrap(), MarkResult::New);
+
+        // Advance to 1s BEFORE the TTL boundary (well past where the OLD one-sided 50s horizon would
+        // have forgotten it): the entry is still live → replay.
+        clock.advance(Duration::from_secs(99));
         assert_eq!(
-            store.mark("f", full_window).unwrap(),
+            store.mark("f", ttl).unwrap(),
             MarkResult::Replay,
-            "the jti must still be remembered past the one-sided window — the replay-TTL hole"
+            "the jti must still be remembered for the entire TTL window — the replay-TTL hole"
         );
-        // Past the full window: forgotten (the proof's own iat freshness check now rejects it anyway).
-        std::thread::sleep(Duration::from_millis(80));
-        assert_eq!(store.mark("f", full_window).unwrap(), MarkResult::New);
+
+        // Advance just PAST the original 100s boundary: `expiry > now` is now false → forgotten → New.
+        // (The first mark's expiry was at now=0 + 100s; we're now at 99s + 2s = 101s.)
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(
+            store.mark("f", ttl).unwrap(),
+            MarkResult::New,
+            "past the full TTL window the jti is forgotten (the proof's own iat check then rejects it)"
+        );
+    }
+
+    #[test]
+    fn fake_clock_drives_expiry_exactly_at_the_boundary() {
+        // Pin the exact `expiry > now` boundary deterministically: at TTL-ε still a replay, at TTL+ε
+        // forgotten. This is the boundary mutation-check for the retention semantics — no timing slack.
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let store = store_with(100_000, std::sync::Arc::clone(&clock));
+        let ttl = Duration::from_secs(60);
+        assert_eq!(store.mark("b", ttl).unwrap(), MarkResult::New);
+        // expiry = base + 60s. Move to base + 60s − 1ns → still live (expiry strictly greater).
+        clock.advance(ttl - Duration::from_nanos(1));
+        assert_eq!(store.mark("b", ttl).unwrap(), MarkResult::Replay);
+        // Move to base + 60s + 1ns → expired (expiry no longer > now) → forgotten.
+        clock.advance(Duration::from_nanos(2));
+        assert_eq!(store.mark("b", ttl).unwrap(), MarkResult::New);
     }
 
     #[test]
@@ -230,24 +338,18 @@ mod tests {
 
     #[test]
     fn capacity_prune_frees_expired_entries() {
-        // Capacity 2, short TTL. Fill to capacity, let them expire, then a NEW jti at capacity must
-        // succeed (the at-capacity prune frees the expired ghosts) — a legit high-volume client is
-        // not blocked by dead entries (roborev round-2 Medium: prune at capacity, not every call).
-        let store = InMemoryReplayStore::new(2, Duration::from_millis(20));
-        assert_eq!(
-            store.mark("a", Duration::from_millis(20)).unwrap(),
-            MarkResult::New
-        );
-        assert_eq!(
-            store.mark("b", Duration::from_millis(20)).unwrap(),
-            MarkResult::New
-        );
-        std::thread::sleep(Duration::from_millis(60)); // both expire
-                                                       // At capacity by count, but both are expired → the prune frees them → this succeeds.
-        assert_eq!(
-            store.mark("c", Duration::from_millis(20)).unwrap(),
-            MarkResult::New
-        );
+        // Capacity 2, short TTL. Fill to capacity, advance past expiry (deterministic — no sleep), then
+        // a NEW jti at capacity must succeed (the at-capacity prune frees the expired ghosts) — a legit
+        // high-volume client is not blocked by dead entries (roborev round-2 Medium: prune at capacity,
+        // not every call).
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let store = store_with(2, std::sync::Arc::clone(&clock));
+        let ttl = Duration::from_secs(20);
+        assert_eq!(store.mark("a", ttl).unwrap(), MarkResult::New);
+        assert_eq!(store.mark("b", ttl).unwrap(), MarkResult::New);
+        clock.advance(Duration::from_secs(60)); // both expire
+                                                // At capacity by count, but both are expired → the prune frees them → this succeeds.
+        assert_eq!(store.mark("c", ttl).unwrap(), MarkResult::New);
     }
 
     #[test]
