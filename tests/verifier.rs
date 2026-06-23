@@ -1705,6 +1705,9 @@ impl solid_oidc_verifier::ReplayStore for ErrReplay {
     ) -> Result<solid_oidc_verifier::MarkResult, solid_oidc_verifier::ReplayBackendError> {
         Err(solid_oidc_verifier::ReplayBackendError("redis down".into()))
     }
+    fn contains(&self, _jti: &str) -> Result<bool, solid_oidc_verifier::ReplayBackendError> {
+        Err(solid_oidc_verifier::ReplayBackendError("redis down".into()))
+    }
 }
 
 #[test]

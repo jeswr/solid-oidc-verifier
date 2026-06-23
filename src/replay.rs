@@ -66,6 +66,24 @@ pub trait ReplayStore: Send + Sync {
     /// Atomically record `jti` as seen for `ttl`. Returns [`MarkResult::New`] on the first sighting
     /// within the window, [`MarkResult::Replay`] otherwise.
     fn mark(&self, jti: &str, ttl: Duration) -> Result<MarkResult, ReplayBackendError>;
+
+    /// READ-ONLY existence probe: `Ok(true)` iff `jti` is currently recorded as seen (i.e. a replay of
+    /// an already-marked, still-live `jti`), `Ok(false)` otherwise. An entry whose window has expired
+    /// MUST read as `false` — consistent with [`mark`](ReplayStore::mark) treating an expired `jti` as
+    /// fresh.
+    ///
+    /// 🔒 **INV-4 — `contains` is strictly READ-ONLY.** It MUST NOT mark, insert, refresh, evict, or
+    /// otherwise mutate any replay state. The authoritative, atomic check-and-set is
+    /// [`mark`](ReplayStore::mark), which remains the single source of truth and the only place a `jti`
+    /// is recorded (the verifier calls it AFTER full DPoP + `cnf.jkt` validation). `contains` exists
+    /// purely as an OPTIMIZATION: a consumer MAY probe it BEFORE the expensive signature/proof
+    /// verification to reject an obvious replay early (parallel to, or ahead of, the crypto) — but it
+    /// is NEVER the source of truth, and a positive [`mark`](ReplayStore::mark) is STILL REQUIRED after
+    /// full validation. Because `contains` records nothing, two requests racing a fresh `jti` can both
+    /// observe `false` here; only [`mark`](ReplayStore::mark)'s atomic check-and-set resolves the race
+    /// (exactly one `New`). A backend implementing this MUST use a non-mutating read (e.g. a Redis
+    /// `EXISTS`, never a `SET`).
+    fn contains(&self, jti: &str) -> Result<bool, ReplayBackendError>;
 }
 
 /// In-memory replay store (single-node v1). A `Mutex`-guarded map of `jti -> expiry` gives an
@@ -162,6 +180,20 @@ impl<C: Clock> ReplayStore for InMemoryReplayStore<C> {
             map.insert(jti.to_string(), now + ttl);
         }
         Ok(MarkResult::New)
+    }
+
+    fn contains(&self, jti: &str) -> Result<bool, ReplayBackendError> {
+        // INV-4: strictly READ-ONLY. We take the lock for a coherent snapshot under the same
+        // monotonic clock as `mark`, but NEVER insert/remove/refresh — not even a lazy prune of the
+        // probed entry. An expired entry reads as NOT contained (its `expiry > now` is false),
+        // matching `mark`'s "an expired jti is fresh again" semantics; the dead entry is left for
+        // `mark`'s at-capacity prune to reap, so `contains` has zero side effects.
+        let now = self.clock.now();
+        let map = self
+            .inner
+            .lock()
+            .map_err(|_| ReplayBackendError("replay store mutex poisoned".into()))?;
+        Ok(matches!(map.get(jti), Some(&expiry) if expiry > now))
     }
 }
 
@@ -373,10 +405,131 @@ mod tests {
         assert_eq!(news, 1, "exactly one racer must win the jti");
     }
 
+    #[test]
+    fn contains_is_false_for_unseen_jti() {
+        let store = InMemoryReplayStore::with_window(Duration::from_secs(305));
+        assert!(
+            !store.contains("never-seen").unwrap(),
+            "an unmarked jti is not contained"
+        );
+    }
+
+    #[test]
+    fn contains_is_true_after_mark() {
+        let store = InMemoryReplayStore::with_window(Duration::from_secs(305));
+        assert_eq!(
+            store.mark("seen", Duration::from_secs(305)).unwrap(),
+            MarkResult::New
+        );
+        assert!(
+            store.contains("seen").unwrap(),
+            "a marked, still-live jti is contained (a replay)"
+        );
+    }
+
+    #[test]
+    fn contains_is_false_after_expiry() {
+        // Deterministic (fake clock): mark, advance past the TTL window, contains() must read false —
+        // an expired jti is NOT contained, mirroring `mark` treating it as fresh again.
+        let clock = std::sync::Arc::new(FakeClock::new());
+        let store = store_with(100_000, std::sync::Arc::clone(&clock));
+        let ttl = Duration::from_secs(20);
+        assert_eq!(store.mark("g", ttl).unwrap(), MarkResult::New);
+        assert!(store.contains("g").unwrap(), "live jti is contained");
+        clock.advance(Duration::from_secs(60));
+        assert!(
+            !store.contains("g").unwrap(),
+            "an expired jti reads as NOT contained"
+        );
+    }
+
+    #[test]
+    fn contains_does_not_mark_so_next_mark_is_new() {
+        // INV-4: contains() is read-only. A contains() probe of a fresh jti must NOT record it, so a
+        // subsequent mark() of the SAME jti still sees it as New (the contains did not insert).
+        let store = InMemoryReplayStore::with_window(Duration::from_secs(305));
+        assert!(
+            !store.contains("probe-then-mark").unwrap(),
+            "fresh jti not yet contained"
+        );
+        // Probe it repeatedly — still must not record anything.
+        assert!(!store.contains("probe-then-mark").unwrap());
+        assert!(!store.contains("probe-then-mark").unwrap());
+        // The authoritative mark must STILL see New — proving contains() never inserted.
+        assert_eq!(
+            store
+                .mark("probe-then-mark", Duration::from_secs(305))
+                .unwrap(),
+            MarkResult::New,
+            "contains() must not mark — the subsequent fresh mark must be New, not Replay"
+        );
+        // And NOW it is contained (because mark recorded it).
+        assert!(store.contains("probe-then-mark").unwrap());
+    }
+
+    #[test]
+    fn contains_then_mark_pre_check_optimization_flow() {
+        // Models the consumer's intended pre-check: contains() is the cheap probe, mark() is the
+        // authoritative source of truth. First request: contains()==false (not a known replay), then
+        // mark()==New. Replay request: contains()==true (early-reject signal) AND mark()==Replay
+        // (the authoritative confirmation). The two never diverge for an already-marked jti.
+        let store = InMemoryReplayStore::with_window(Duration::from_secs(305));
+        let ttl = Duration::from_secs(305);
+
+        // First sighting.
+        assert!(!store.contains("flow").unwrap());
+        assert_eq!(store.mark("flow", ttl).unwrap(), MarkResult::New);
+
+        // Replay sighting: the cheap probe agrees with the authoritative mark.
+        assert!(
+            store.contains("flow").unwrap(),
+            "pre-check sees the known replay"
+        );
+        assert_eq!(
+            store.mark("flow", ttl).unwrap(),
+            MarkResult::Replay,
+            "authoritative mark confirms the replay"
+        );
+    }
+
+    #[test]
+    fn concurrent_contains_and_mark_are_consistent() {
+        use std::sync::Arc;
+        // Concurrency: N threads each probe-then-mark the SAME jti. contains() is racy by design (it
+        // records nothing), so several probers may see false — but the AUTHORITATIVE mark()'s atomic
+        // check-and-set must still admit EXACTLY ONE New, and every contains() result must be a clean
+        // boolean (no panic / lock poison). The invariant under test is mark()'s atomicity holding
+        // while contains() runs concurrently against the same lock.
+        let store = Arc::new(InMemoryReplayStore::with_window(Duration::from_secs(305)));
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let s = Arc::clone(&store);
+            handles.push(std::thread::spawn(move || {
+                // probe (read-only) then the authoritative mark
+                let _ = s.contains("c-race").unwrap();
+                s.mark("c-race", Duration::from_secs(305)).unwrap()
+            }));
+        }
+        let news = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|r| *r == MarkResult::New)
+            .count();
+        assert_eq!(
+            news, 1,
+            "exactly one racer wins the jti even with concurrent contains() probes"
+        );
+        // After the storm, the jti is contained exactly once-and-for-all.
+        assert!(store.contains("c-race").unwrap());
+    }
+
     /// A fail-closed test stub: a store that always errors. The verifier turns this into a 503.
     struct AlwaysErr;
     impl ReplayStore for AlwaysErr {
         fn mark(&self, _jti: &str, _ttl: Duration) -> Result<MarkResult, ReplayBackendError> {
+            Err(ReplayBackendError("backend down".into()))
+        }
+        fn contains(&self, _jti: &str) -> Result<bool, ReplayBackendError> {
             Err(ReplayBackendError("backend down".into()))
         }
     }
