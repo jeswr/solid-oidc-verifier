@@ -134,12 +134,12 @@ type ResolveJob = (
 /// `solid-server-rs`) calls `Verifier::verify` directly (not via `spawn_blocking`).
 ///
 /// The fix: own a dedicated background thread that runs a *current-thread* Tokio runtime and a
-/// [`hickory_resolver::TokioAsyncResolver`] (genuinely async `lookup_ip`). `resolve_host` ships the
+/// [`hickory_resolver::TokioResolver`] (genuinely async `lookup_ip`). `resolve_host` ships the
 /// host to that thread over a channel and blocks on the reply. The `block_on` now happens on a thread
 /// that has NO ambient runtime, so it is legal — no panic — and the caller's runtime is never touched.
 ///
 /// ## Concurrent lookups (the head-of-line-blocking fix)
-/// The resolver thread drives lookups CONCURRENTLY rather than one-at-a-time. A `TokioAsyncResolver` is
+/// The resolver thread drives lookups CONCURRENTLY rather than one-at-a-time. A `TokioResolver` is
 /// cheaply cloneable (`Arc`-shared internals), so the dispatch loop — a single `block_on` of an async
 /// task that drains the (async) job channel — `tokio::spawn`s each `lookup_ip` onto the thread's runtime
 /// with its own clone of the resolver and replies on that job's own oneshot channel. A slow lookup
@@ -161,7 +161,7 @@ pub struct SystemResolver {
 
 impl SystemResolver {
     /// Build the resolver: spawn the dedicated thread that owns a current-thread Tokio runtime + an
-    /// async `TokioAsyncResolver` (system `/etc/resolv.conf`, falling back to a sane default). The
+    /// async `TokioResolver` (system `/etc/resolv.conf`, falling back to a sane default). The
     /// runtime + resolver are built ON that thread (so no ambient-runtime requirement at construction),
     /// and the thread loops serving resolution jobs until the `SystemResolver` (and thus the sender) is
     /// dropped.
@@ -189,17 +189,36 @@ impl SystemResolver {
                     }
                 };
 
-                // Build the ASYNC resolver. `tokio_from_system_conf` reads /etc/resolv.conf; fall back
-                // to the default config on a platform/host without one (mirrors the prior behaviour).
+                // Build the ASYNC resolver. `builder_tokio()` reads /etc/resolv.conf (hickory 0.26's
+                // replacement for the old `tokio_from_system_conf`); fall back to an explicit Google-DNS
+                // config on a platform/host without one. NOTE (hickory 0.24 -> 0.26 behaviour-preserve):
+                // in 0.24 `ResolverConfig::default()` WAS Google DNS, but in 0.26 the derived `Default`
+                // is an EMPTY config (no nameservers) that resolves NOTHING — so the fallback must name
+                // a real public resolver explicitly (`udp_and_tcp(&GOOGLE)`) to keep the prior behaviour.
                 // Cloneable (`Arc`-shared internals) so each spawned lookup gets its own cheap clone.
-                let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-                    .unwrap_or_else(|_| {
-                        hickory_resolver::TokioAsyncResolver::tokio(
-                            hickory_resolver::config::ResolverConfig::default(),
-                            hickory_resolver::config::ResolverOpts::default(),
-                        )
-                    });
-                // Resolver construction is infallible here (the fallback can't fail), so signal ready.
+                let resolver = match hickory_resolver::Resolver::builder_tokio()
+                    .and_then(|builder| builder.build())
+                {
+                    Ok(resolver) => resolver,
+                    Err(_) => match hickory_resolver::Resolver::builder_with_config(
+                        hickory_resolver::config::ResolverConfig::udp_and_tcp(
+                            &hickory_resolver::config::GOOGLE,
+                        ),
+                        hickory_resolver::net::runtime::TokioRuntimeProvider::default(),
+                    )
+                    .build()
+                    {
+                        Ok(resolver) => resolver,
+                        // Fail CLOSED: if even the explicit fallback resolver cannot be built, report
+                        // init failure to `new()` rather than serving an unusable resolver. (Unlike
+                        // 0.24, resolver construction is now fallible end-to-end.)
+                        Err(e) => {
+                            let _ = init_tx.send(Err(format!("DNS resolver init failed: {e}")));
+                            return;
+                        }
+                    },
+                };
+                // Resolver construction succeeded, so signal ready.
                 let _ = init_tx.send(Ok(()));
 
                 // Drive the shared concurrent dispatch loop with the production hickory lookup. Each job

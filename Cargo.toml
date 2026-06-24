@@ -2,7 +2,7 @@
 name = "solid-oidc-verifier"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.81"
+rust-version = "1.88"
 description = "EXPERIMENTAL standalone DPoP-bound Solid-OIDC resource-server access-token verifier (RFC 6750/9068/9449). Issuer-agnostic, asymmetric-only, with a DNS-pinned SSRF-safe WebID resolver. Part of an experimental Rust-server track; not a replacement for the existing prod-solid-server."
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/jeswr/solid-oidc-verifier"
@@ -38,7 +38,11 @@ url = "2"
 # the connection to a validated IP — the load-bearing security plumbing.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "sync", "macros", "time"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking"], optional = true }
-hickory-resolver = { version = "0.24", optional = true }
+# Pinned to >=0.26.1: the 0.24 line's `hickory-proto` is vulnerable to GHSA-q2qq-hmj6-3wpp (O(n^2)
+# name-compression CPU exhaustion / DoS during DNS message encoding); the fix is only on hickory-proto
+# 0.26.1, reachable ONLY via hickory-resolver 0.26. This raises the crate MSRV to 1.88 (hickory-resolver
+# 0.26.1's rust-version) and migrates `src/net.rs` to the 0.26 `Resolver::builder_tokio()` API.
+hickory-resolver = { version = "0.26.1", optional = true }
 # WebID profile RDF parsing. oxttl is the W3C-rdf-tests-driven Turtle/N-Triples parser (the N3.js
 # replacement per the Rust-migration spike §4) — we parse profiles via it rather than hand-rolling an
 # RDF parser (the suite "never hand-build/parse triples" rule). Only the `solid:oidcIssuer` objects are
