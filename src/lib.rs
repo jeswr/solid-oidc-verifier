@@ -24,6 +24,15 @@
 //!   `iat`, single-use `jti` (pluggable replay store, fail-closed), the `ath` access-token binding
 //!   (with the opt-in three-state `allow_missing_ath` compat), and `cnf.jkt` == the RFC 7638
 //!   thumbprint of the proof's JWK (proof-of-possession).
+//! - **RFC 8705 certificate-bound access tokens** (`cnf["x5t#S256"]`): when a token declares a
+//!   certificate confirmation, proof-of-possession is the mutual-TLS client certificate rather than a
+//!   DPoP proof. The host computes `base64url(SHA-256(DER(cert)))` from its TLS layer once per
+//!   connection and passes it in via [`AuthRequest::client_cert_x5t_s256`]; the verifier constant-time
+//!   compares it to the token's confirmation (RFC 8705 §3: the RS "MUST verify that the certificate
+//!   matches"). No TLS code enters the crate — it stays issuer-agnostic and transport-agnostic. The
+//!   two confirmation methods never substitute for each other (no downgrade in either direction), a
+//!   token carrying BOTH is rejected as ambiguous, and a certificate-bound token with no presented
+//!   certificate is rejected (fail-closed, never accepted bare). See [`verifier::Confirmation`].
 //! - A **WebID** claim (configurable name) that is an `https:` URL, an authorized-party allowlist, and
 //!   an optional bidirectional WebID↔issuer check with a DNS-pinned SSRF-safe resolver seam.
 //!
@@ -86,6 +95,7 @@
 //!     dpop: Some("<proof>".to_string()),
 //!     method: "GET".to_string(),
 //!     url: "https://pod.example/alice/data".to_string(),
+//!     client_cert_x5t_s256: None, // RFC 8705 cert thumbprint (None ⇒ plain DPoP)
 //! };
 //! match verifier.verify(&req) {
 //!     Ok(token) if token.is_public() => { /* unauthenticated — public resources only */ }
@@ -123,7 +133,7 @@ pub use ssrf::{
     is_loopback_address, is_public_address, is_public_address_with_nat64, Nat64Nsp, Nat64NspError,
     Nat64Policy,
 };
-pub use verifier::{AuthRequest, VerifiedToken, Verifier};
+pub use verifier::{AuthRequest, Confirmation, VerifiedToken, Verifier};
 #[cfg(feature = "network")]
 pub use webid::NetworkWebIdResolver;
 pub use webid::{

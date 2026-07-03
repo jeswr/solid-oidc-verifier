@@ -51,11 +51,12 @@ fn accepts_valid_es512_access_token_and_proof() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect("ES512 token + proof should verify");
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
     assert_eq!(creds.issuer.as_deref(), Some(ISSUER));
-    assert_eq!(creds.cnf_jkt.as_deref(), Some(client.thumbprint.as_str()));
+    assert_eq!(creds.cnf_jkt(), Some(client.thumbprint.as_str()));
 }
 
 /// The DPoP proof itself is an ES512 (`dpop+jwt`) JWS with an embedded P-521 JWK — the (e) cnf.jkt
@@ -75,9 +76,10 @@ fn es512_proof_p521_thumbprint_matches_cnf_jkt() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect("P-521 cnf.jkt thumbprint binding should hold");
-    assert_eq!(creds.cnf_jkt.as_deref(), Some(client.thumbprint.as_str()));
+    assert_eq!(creds.cnf_jkt(), Some(client.thumbprint.as_str()));
 }
 
 /// A mismatched P-521 cnf.jkt (token bound to one P-521 key, proof embeds another) is rejected.
@@ -96,6 +98,7 @@ fn rejects_es512_proof_cnf_jkt_mismatch() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("cnf.jkt mismatch must be rejected");
     assert_eq!(err.status(), 401);
@@ -124,6 +127,7 @@ fn rejects_es512_forged_signature_wrong_key() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("forged signature must be rejected");
     assert_eq!(err.status(), 401);
@@ -153,6 +157,7 @@ fn rejects_es512_tampered_payload() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("tampered payload must be rejected");
     assert_eq!(err.status(), 401);
@@ -184,6 +189,7 @@ fn rejects_es512_with_p256_jwks_key_wrong_curve() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("a P-256 JWKS key must not be accepted for ES512");
     assert_eq!(err.status(), 401);
@@ -220,6 +226,7 @@ fn rejects_es512_proof_embedding_p256_key() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("an embedded P-256 key must not act as an ES512 proof key");
     assert_eq!(err.status(), 401);
@@ -269,6 +276,7 @@ fn rejects_es512_malformed_coordinates_no_panic() {
                 dpop: Some(proof),
                 method: METHOD.into(),
                 url: URL.into(),
+                client_cert_x5t_s256: None,
             })
             .unwrap_err_or_panic(&bad);
         assert_eq!(err.status(), 401, "malformed key {bad:?} should 401");
@@ -309,6 +317,7 @@ fn rejects_es512_malformed_signature_length() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect_err("a wrong-length ES512 signature must be rejected");
     assert_eq!(err.status(), 401);
@@ -343,6 +352,7 @@ fn rs256_still_verifies_with_es512_feature_on() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect("RS256 must still verify (no regression) with the es512 feature on");
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -378,6 +388,7 @@ fn es256_still_verifies_with_es512_feature_on() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect("ES256 must still verify (no regression) with the es512 feature on");
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));

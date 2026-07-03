@@ -99,6 +99,7 @@ fn keycloak_dpop_token_verifies_end_to_end() {
         dpop: Some(proof),
         method: "GET".to_string(),
         url: request_url,
+        client_cert_x5t_s256: None,
     };
     let token = verifier
         .verify(&req)

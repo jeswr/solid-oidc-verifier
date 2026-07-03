@@ -50,6 +50,19 @@ explicitly, holding it to the same exhaustive-test bar as the TS source.
   replay store, **fail-closed**), the `ath` access-token binding, and **`cnf.jkt` == the
   [RFC 7638](https://www.rfc-editor.org/rfc/rfc7638) thumbprint of the proof's JWK** (proof of
   possession).
+- **RFC 8705 certificate-bound access tokens** — when a token carries `cnf["x5t#S256"]` its
+  proof-of-possession is the **mutual-TLS client certificate**, not a DPoP proof. The host computes
+  `base64url(SHA-256(DER(cert)))` from its TLS layer **once per connection** and passes it in via
+  `AuthRequest.client_cert_x5t_s256`; the verifier **constant-time** compares it to the token's
+  confirmation ([RFC 8705 §3](https://www.rfc-editor.org/rfc/rfc8705.html#section-3): the RS "MUST
+  verify that the certificate matches"). **No TLS code enters the crate** — it only compares the hash
+  the host supplies, so it stays issuer- and transport-agnostic and dependency-free. Fail-closed and
+  no-downgrade: a certificate-bound token with no presented certificate is **rejected** (never bare),
+  a token asserting **both** `cnf.jkt` and `cnf["x5t#S256"]` is rejected as ambiguous, a
+  certificate-bound token is **never** provable by a DPoP proof, and a DPoP-bound token is **never**
+  provable by a presented certificate. The verified confirmation is surfaced as
+  `VerifiedToken::confirmation` (`Confirmation::Jkt` | `Confirmation::X5tS256`), with `cnf_jkt()` /
+  `cert_x5t_s256()` accessors. (Tier-1a of the high-throughput proof-of-possession design.)
 - A **WebID** claim (configurable name) that is an `https:` URL with no userinfo, an authorized-party
   (`azp`/`client_id`) allowlist, and an optional **bidirectional WebID↔issuer** check via a DNS-pinned
   SSRF-safe resolver seam.
@@ -141,14 +154,18 @@ let req = AuthRequest {
     // The EXACT reconstructed request URL the client signed into the proof's `htu`
     // (proxy-aware, scheme/host/port/path; query + fragment stripped).
     url: "https://pod.example/alice/data".to_string(),
+    // RFC 8705 cert-bound tokens only: base64url(SHA-256(DER)) of the client cert the TLS layer
+    // exposed on THIS connection (compute once per connection). `None` for plain DPoP.
+    client_cert_x5t_s256: None,
 };
 
 match verifier.verify(&req) {
     Ok(token) if token.is_public() => { /* unauthenticated — serve public resources only */ }
     Ok(token) => {
-        let _webid = token.web_id;       // the authenticated agent
+        let _webid = token.web_id;              // the authenticated agent
         let _issuer = token.issuer;
-        let _jkt = token.cnf_jkt;
+        let _confirmation = &token.confirmation; // Confirmation::Jkt (DPoP) | X5tS256 (cert-bound)
+        let _jkt = token.cnf_jkt();              // Some(..) only for DPoP-bound tokens
     }
     Err(e) => {
         let _status = e.status();                       // 401 (auth) or 503 (replay store down)
@@ -164,6 +181,7 @@ match verifier.verify(&req) {
 | Access-token RFC-9068 validation | ✅ implemented + tested | — |
 | DPoP RFC-9449 proof validation | ✅ implemented + tested | — |
 | RFC 7638 `cnf.jkt` thumbprint | ✅ implemented + tested | — |
+| RFC 8705 `cnf["x5t#S256"]` certificate-bound tokens (constant-time compare, fail-closed, no-downgrade) | ✅ implemented + tested | host supplies the per-connection cert thumbprint from its TLS layer |
 | `ath` three-state compat | ✅ implemented + tested | — |
 | `jti` replay (trait + in-memory: atomic check-and-set, never-evict-live, fail-closed at capacity) | ✅ implemented + tested | shared Redis `SET NX` impl (`ReplayStore`) |
 | SSRF address classifier + URL gate | ✅ implemented + tested | — |

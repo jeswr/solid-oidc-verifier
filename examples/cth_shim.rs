@@ -149,6 +149,11 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respo
         dpop: header_str(req.headers(), "dpop"),
         method,
         url,
+        // RFC 8705 cert-bound tokens: a real resource server computes base64url(SHA-256(DER)) from the
+        // client certificate its TLS layer exposes once per connection (e.g. rustls
+        // `peer_certificates()`), and passes it here. This HTTP-only shim terminates no TLS, so it is
+        // always `None` — cert-bound tokens are therefore rejected fail-closed, plain DPoP is unaffected.
+        client_cert_x5t_s256: None,
     };
 
     match state.verifier.verify(&auth_req) {

@@ -44,6 +44,44 @@ pub struct AuthRequest {
     pub method: String,
     /// The reconstructed request URL (scheme/host/port/path; query+fragment stripped).
     pub url: String,
+    /// The RFC 8705 §3.1 certificate thumbprint of the client certificate presented on THIS
+    /// connection, if any: `base64url(SHA-256(DER(cert)))`. The host computes this ONCE per TLS
+    /// connection from its TLS layer and passes it in; **no TLS code enters the verifier** — it only
+    /// compares this value against a certificate-bound token's `cnf["x5t#S256"]`. `None` ⇒ no client
+    /// certificate was presented (a certificate-bound token is then rejected, fail-closed). Irrelevant
+    /// for the DPoP (`cnf.jkt`) path — it is ignored there.
+    pub client_cert_x5t_s256: Option<String>,
+}
+
+/// How an access token proves possession — its `cnf` (RFC 7800) confirmation method. A token carries
+/// **at most one**: `cnf.jkt` (RFC 9449 DPoP key thumbprint) OR `cnf["x5t#S256"]` (RFC 8705 §3.1
+/// mutual-TLS client-certificate thumbprint). A token asserting BOTH is rejected as ambiguous
+/// (see [`extract_confirmation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirmation {
+    /// RFC 9449 DPoP: the RFC 7638 thumbprint of the proof's public JWK. PoP is a fresh DPoP proof.
+    Jkt(String),
+    /// RFC 8705 §3.1 certificate-bound: `base64url(SHA-256(DER(client cert)))`. PoP is the mutual-TLS
+    /// client certificate — verified by comparing against [`AuthRequest::client_cert_x5t_s256`].
+    X5tS256(String),
+}
+
+impl Confirmation {
+    /// The DPoP `cnf.jkt` thumbprint, if this is the DPoP confirmation method.
+    pub fn as_jkt(&self) -> Option<&str> {
+        match self {
+            Confirmation::Jkt(j) => Some(j),
+            Confirmation::X5tS256(_) => None,
+        }
+    }
+
+    /// The certificate `cnf["x5t#S256"]` thumbprint, if this is the mTLS confirmation method.
+    pub fn as_x5t_s256(&self) -> Option<&str> {
+        match self {
+            Confirmation::X5tS256(t) => Some(t),
+            Confirmation::Jkt(_) => None,
+        }
+    }
 }
 
 /// The verified caller identity (TS `Credentials`). Public (unauthenticated) when `web_id` is `None`.
@@ -57,8 +95,10 @@ pub struct VerifiedToken {
     pub client_id: Option<String>,
     /// The granted `scope` (space-delimited), if present.
     pub scopes: Vec<String>,
-    /// The `cnf.jkt` thumbprint the token is bound to, if DPoP-bound.
-    pub cnf_jkt: Option<String>,
+    /// The confirmation method (`cnf`) the token is bound to, if any: DPoP (`cnf.jkt`) or
+    /// certificate-bound (`cnf["x5t#S256"]`, RFC 8705). `None` ⇒ a bare (non-PoP) token — only
+    /// reachable when the verifier is configured to accept it.
+    pub confirmation: Option<Confirmation>,
     /// The `exp` (epoch seconds), if present.
     pub expiry: Option<i64>,
 }
@@ -71,6 +111,20 @@ impl VerifiedToken {
 
     pub fn is_public(&self) -> bool {
         self.web_id.is_none()
+    }
+
+    /// The DPoP `cnf.jkt` thumbprint the token is bound to, if it is DPoP-bound. Returns `None` for a
+    /// certificate-bound or bare token. (Backward-compatible accessor for the former `cnf_jkt` field.)
+    pub fn cnf_jkt(&self) -> Option<&str> {
+        self.confirmation.as_ref().and_then(Confirmation::as_jkt)
+    }
+
+    /// The RFC 8705 `cnf["x5t#S256"]` certificate thumbprint the token is bound to, if it is
+    /// certificate-bound. Returns `None` for a DPoP-bound or bare token.
+    pub fn cert_x5t_s256(&self) -> Option<&str> {
+        self.confirmation
+            .as_ref()
+            .and_then(Confirmation::as_x5t_s256)
     }
 }
 
@@ -169,7 +223,11 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
                 .and_then(Value::as_str)
                 .map(|s| s.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default(),
-            cnf_jkt: extract_cnf_jkt(&claims),
+            // Infallible here: `validate_token` already called `extract_confirmation` and rejected an
+            // ambiguous both-`cnf` token, so a second parse cannot newly fail. We nonetheless map any
+            // error to `None` rather than `unwrap` — a bound token that reached this point was already
+            // validated down its confirmation-specific path.
+            confirmation: extract_confirmation(&claims).unwrap_or(None),
             expiry: claims.get("exp").and_then(Value::as_i64),
         })
     }
@@ -188,30 +246,44 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         // only the proof's ath requirement).
         let claims = self.validate_access_token(parsed, claimed_issuer)?;
 
-        // (Finding #1, roborev High) A DPoP-BOUND token (carrying `cnf.jkt`) MUST have its proof
-        // verified regardless of the presentation scheme or `require_dpop`. Otherwise a captured
-        // bound token presented as `Bearer` (when `require_dpop=false`) would be accepted without
-        // proof-of-possession — a token-replay downgrade. So `must_dpop` is true whenever the request
-        // is DPoP-scheme / DPoP-required OR the token itself is cnf-bound. (The `oauth4webapi` library
-        // the TS verifier delegates to enforces exactly this: it runs its DPoP step whenever the token
-        // carries `cnf.jkt`.)
-        let cnf_jkt = extract_cnf_jkt(&claims);
-        let must_dpop = dpop || cnf_jkt.is_some();
+        // Parse the token's confirmation method (`cnf`). A token carrying BOTH `cnf.jkt` and
+        // `cnf["x5t#S256"]` is ambiguous and rejected here, BEFORE any PoP dispatch — a fail-closed
+        // malformed-token rejection (never "pick one").
+        let confirmation = extract_confirmation(&claims)?;
 
-        if must_dpop {
-            let proof = req.dpop.as_deref().ok_or_else(|| {
-                invalid_token_dpop("DPoP proof is required (no DPoP HTTP Header).")
-            })?;
-            let cnf_jkt = cnf_jkt.ok_or_else(|| {
-                invalid_token_dpop(
-                    "Access token is not DPoP-bound (no cnf.jkt confirmation claim).",
-                )
-            })?;
-            // ath-compat path: opted in AND the presented proof omits `ath` (a present-but-wrong ath
-            // still takes the strict path and is rejected).
-            let ath_compat = self.config.allow_missing_ath && !proof_has_ath(proof);
-            let require_ath = !ath_compat;
-            self.validate_dpop_proof(req, proof, &parsed.token, &cnf_jkt, require_ath)?;
+        // Dispatch on the token's CONFIRMATION METHOD — never on the presentation scheme. This is the
+        // no-downgrade invariant (both directions): a certificate-bound token is proven ONLY by the
+        // certificate (never by a DPoP proof), and a DPoP-bound token is proven ONLY by a fresh DPoP
+        // proof (never by a presented certificate). The two paths never substitute for each other.
+        match &confirmation {
+            // RFC 8705 certificate-bound: PoP is the mutual-TLS client certificate. A DPoP proof, even
+            // if one is presented alongside, is IRRELEVANT to this token and is not consulted here.
+            Some(Confirmation::X5tS256(cert_x5t)) => {
+                self.validate_cert_bound(req, cert_x5t)?;
+            }
+            // RFC 9449 DPoP-bound: the proof is REQUIRED regardless of the presentation scheme or
+            // `require_dpop` (Finding #1, roborev High — otherwise a captured bound token presented as
+            // `Bearer` when `require_dpop=false` would be accepted without proof-of-possession, a
+            // token-replay downgrade). `oauth4webapi` enforces exactly this: it runs its DPoP step
+            // whenever the token carries `cnf.jkt`.
+            Some(Confirmation::Jkt(cnf_jkt)) => {
+                self.validate_dpop_bound(req, &parsed.token, cnf_jkt)?;
+            }
+            // No confirmation claim. If DPoP is required/requested we still demand a proof + a binding;
+            // with neither present this is the existing "not DPoP-bound" rejection (message + ordering
+            // preserved). If DPoP is NOT required (config opt-out) a bare token is accepted.
+            None => {
+                if dpop {
+                    // Preserve the prior error ordering: a missing DPoP header reports first, then the
+                    // missing binding.
+                    let _proof = req.dpop.as_deref().ok_or_else(|| {
+                        invalid_token_dpop("DPoP proof is required (no DPoP HTTP Header).")
+                    })?;
+                    return Err(invalid_token_dpop(
+                        "Access token is not DPoP-bound (no cnf.jkt confirmation claim).",
+                    ));
+                }
+            }
         }
 
         Ok(claims)
@@ -283,6 +355,58 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         self.check_temporal(&claims)?;
 
         Ok(claims)
+    }
+
+    /// Validate a DPoP-bound (`cnf.jkt`) token's proof-of-possession: a fresh DPoP proof is REQUIRED,
+    /// then verified per RFC 9449 (routing to the `ath`-compat path only when opted in AND the proof
+    /// omits `ath`). This is the DPoP arm of the confirmation dispatch — unchanged in behaviour from
+    /// the pre-cnf-x5t code.
+    fn validate_dpop_bound(
+        &self,
+        req: &AuthRequest,
+        access_token: &str,
+        cnf_jkt: &str,
+    ) -> Result<(), VerifyError> {
+        let proof = req
+            .dpop
+            .as_deref()
+            .ok_or_else(|| invalid_token_dpop("DPoP proof is required (no DPoP HTTP Header)."))?;
+        // ath-compat path: opted in AND the presented proof omits `ath` (a present-but-wrong ath still
+        // takes the strict path and is rejected).
+        let ath_compat = self.config.allow_missing_ath && !proof_has_ath(proof);
+        let require_ath = !ath_compat;
+        self.validate_dpop_proof(req, proof, access_token, cnf_jkt, require_ath)
+    }
+
+    /// Validate an RFC 8705 §3 certificate-bound (`cnf["x5t#S256"]`) access token. The RS "**MUST
+    /// verify that the certificate matches**" (RFC 8705 §3): the client certificate presented on THIS
+    /// connection MUST be present AND its `base64url(SHA-256(DER))` thumbprint MUST equal the token's
+    /// `cnf["x5t#S256"]`, compared in constant time. Fail-closed on every branch:
+    /// - no presented certificate ([`AuthRequest::client_cert_x5t_s256`] is `None`) ⇒ reject (a
+    ///   certificate-bound token is NEVER accepted bare);
+    /// - thumbprint mismatch ⇒ reject.
+    ///
+    /// The verifier performs **no** TLS work and holds **no** certificate bytes — it only compares the
+    /// hash the host computed once per connection. This keeps the crate issuer-agnostic and
+    /// dependency-free. There is NO DPoP fallback here: a certificate-bound token cannot be proven by a
+    /// DPoP proof (the no-downgrade invariant).
+    fn validate_cert_bound(
+        &self,
+        req: &AuthRequest,
+        expected_x5t_s256: &str,
+    ) -> Result<(), VerifyError> {
+        let presented = req.client_cert_x5t_s256.as_deref().ok_or_else(|| {
+            invalid_token(
+                "Certificate-bound access token requires a client certificate (none presented).",
+            )
+        })?;
+        if !constant_time_str_eq(presented, expected_x5t_s256) {
+            return Err(invalid_token(
+                "Certificate-bound access token confirmation mismatch \
+                 (cnf.x5t#S256 != presented client certificate thumbprint).",
+            ));
+        }
+        Ok(())
     }
 
     /// Validate the DPoP proof (RFC 9449): self-signed by the embedded public JWK, asymmetric alg,
@@ -537,15 +661,53 @@ fn ath(token: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
-/// Extract a non-empty string `cnf.jkt` from claims (TS `extractCnfJkt`).
-fn extract_cnf_jkt(claims: &Claims) -> Option<String> {
-    claims
-        .get("cnf")
-        .and_then(Value::as_object)
-        .and_then(|cnf| cnf.get("jkt"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
+/// Parse the token's `cnf` (RFC 7800) confirmation method into a [`Confirmation`].
+///
+/// - `cnf.jkt` (a non-empty string)        → [`Confirmation::Jkt`] (RFC 9449 DPoP);
+/// - `cnf["x5t#S256"]` (a non-empty string) → [`Confirmation::X5tS256`] (RFC 8705 §3.1 cert-bound);
+/// - neither present                        → `Ok(None)`;
+/// - BOTH present                           → `Err` — ambiguous/malformed, rejected fail-closed
+///   (RFC 8705 §3.1 defines a token as bound to ONE method; a token asserting two confirmations is
+///   not something we choose between).
+///
+/// A `cnf` that is not an object, or whose member is missing / not a non-empty string, means that
+/// member does NOT bind the token (treated as absent) — never a silent downgrade of a real binding.
+fn extract_confirmation(claims: &Claims) -> Result<Option<Confirmation>, VerifyError> {
+    let cnf = match claims.get("cnf").and_then(Value::as_object) {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    fn non_empty(v: Option<&Value>) -> Option<&str> {
+        v.and_then(Value::as_str).filter(|s| !s.is_empty())
+    }
+    let jkt = non_empty(cnf.get("jkt"));
+    let x5t = non_empty(cnf.get("x5t#S256"));
+    match (jkt, x5t) {
+        (Some(_), Some(_)) => Err(invalid_token(
+            "Access token confirmation is ambiguous (both cnf.jkt and cnf.x5t#S256 present).",
+        )),
+        (Some(j), None) => Ok(Some(Confirmation::Jkt(j.to_string()))),
+        (None, Some(t)) => Ok(Some(Confirmation::X5tS256(t.to_string()))),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Constant-time equality of two byte-strings — no data-dependent branch or early return, so a
+/// certificate-thumbprint comparison cannot become a timing oracle for the secret thumbprint. The
+/// length pre-check is NOT secret-dependent (RFC 8705 `x5t#S256` values are fixed-length base64url
+/// SHA-256 strings; a differing length can only be a malformed input, and the value is a public
+/// hash, not a secret). `black_box` on the accumulator prevents the optimizer from reintroducing a
+/// short-circuit.
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff: u8 = 0;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 /// Whether the configured audience is present in the token's `aud` (a string or an array). RFC 9068.
@@ -626,12 +788,105 @@ mod tests {
         assert!(audience_matches(&c, "https://pod.example"));
     }
 
-    #[test]
-    fn extract_cnf_jkt_reads_nested() {
+    fn claims_with_cnf(cnf: Value) -> Claims {
         let mut c = Claims::new();
-        let mut cnf = serde_json::Map::new();
-        cnf.insert("jkt".into(), Value::String("thumb".into()));
-        c.insert("cnf".into(), Value::Object(cnf));
-        assert_eq!(extract_cnf_jkt(&c), Some("thumb".to_string()));
+        c.insert("cnf".into(), cnf);
+        c
+    }
+
+    #[test]
+    fn extract_confirmation_reads_jkt() {
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb" }));
+        assert_eq!(
+            extract_confirmation(&c).unwrap(),
+            Some(Confirmation::Jkt("thumb".into()))
+        );
+    }
+
+    #[test]
+    fn extract_confirmation_reads_x5t_s256() {
+        let c = claims_with_cnf(serde_json::json!({ "x5t#S256": "certhash" }));
+        assert_eq!(
+            extract_confirmation(&c).unwrap(),
+            Some(Confirmation::X5tS256("certhash".into()))
+        );
+    }
+
+    #[test]
+    fn extract_confirmation_none_when_absent_or_empty() {
+        // No cnf at all.
+        assert_eq!(extract_confirmation(&Claims::new()).unwrap(), None);
+        // cnf present but empty object.
+        let c = claims_with_cnf(serde_json::json!({}));
+        assert_eq!(extract_confirmation(&c).unwrap(), None);
+        // Empty-string members bind nothing.
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "", "x5t#S256": "" }));
+        assert_eq!(extract_confirmation(&c).unwrap(), None);
+        // cnf is not an object.
+        let c = claims_with_cnf(Value::String("nope".into()));
+        assert_eq!(extract_confirmation(&c).unwrap(), None);
+        // Non-string member is ignored.
+        let c = claims_with_cnf(serde_json::json!({ "jkt": 42 }));
+        assert_eq!(extract_confirmation(&c).unwrap(), None);
+    }
+
+    #[test]
+    fn extract_confirmation_rejects_both_cnf_present() {
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb", "x5t#S256": "certhash" }));
+        let err = extract_confirmation(&c).unwrap_err();
+        assert_eq!(err.status(), 401);
+    }
+
+    #[test]
+    fn extract_confirmation_one_empty_one_set_is_unambiguous() {
+        // Empty jkt + real x5t ⇒ cert-bound (the empty member does not count as "present").
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "", "x5t#S256": "certhash" }));
+        assert_eq!(
+            extract_confirmation(&c).unwrap(),
+            Some(Confirmation::X5tS256("certhash".into()))
+        );
+        // Real jkt + empty x5t ⇒ DPoP-bound.
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb", "x5t#S256": "" }));
+        assert_eq!(
+            extract_confirmation(&c).unwrap(),
+            Some(Confirmation::Jkt("thumb".into()))
+        );
+    }
+
+    #[test]
+    fn constant_time_str_eq_matches_semantics_of_plain_eq() {
+        assert!(constant_time_str_eq("abc", "abc"));
+        assert!(!constant_time_str_eq("abc", "abd"));
+        assert!(!constant_time_str_eq("abc", "abcd")); // length differs
+        assert!(!constant_time_str_eq("", "a"));
+        assert!(constant_time_str_eq("", ""));
+        // A realistic base64url SHA-256 thumbprint pair.
+        let t = "Zk8oPq2s3v4w5x6y7z8A9B0C1D2E3F4G5H6I7J8K9L0";
+        assert!(constant_time_str_eq(t, t));
+        assert!(!constant_time_str_eq(t, &t.replace('Z', "a")));
+    }
+
+    #[test]
+    fn confirmation_accessors() {
+        assert_eq!(Confirmation::Jkt("j".into()).as_jkt(), Some("j"));
+        assert_eq!(Confirmation::Jkt("j".into()).as_x5t_s256(), None);
+        assert_eq!(Confirmation::X5tS256("c".into()).as_x5t_s256(), Some("c"));
+        assert_eq!(Confirmation::X5tS256("c".into()).as_jkt(), None);
+    }
+
+    #[test]
+    fn verified_token_confirmation_accessors() {
+        let t = VerifiedToken {
+            confirmation: Some(Confirmation::X5tS256("c".into())),
+            ..Default::default()
+        };
+        assert_eq!(t.cert_x5t_s256(), Some("c"));
+        assert_eq!(t.cnf_jkt(), None);
+        let t = VerifiedToken {
+            confirmation: Some(Confirmation::Jkt("j".into())),
+            ..Default::default()
+        };
+        assert_eq!(t.cnf_jkt(), Some("j"));
+        assert_eq!(t.cert_x5t_s256(), None);
     }
 }

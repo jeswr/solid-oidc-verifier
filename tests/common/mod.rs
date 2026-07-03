@@ -76,6 +76,9 @@ pub struct TokenOpts {
     pub omit_webid: bool,
     pub webid_claim: Option<String>,
     pub cnf_jkt: Option<String>,
+    /// RFC 8705 §3.1 certificate-bound confirmation: emits `cnf["x5t#S256"]`. May be combined with
+    /// `cnf_jkt` to exercise the ambiguous both-present rejection.
+    pub cnf_x5t_s256: Option<String>,
     pub omit_cnf: bool,
     pub alg: Option<String>,
     pub expires_at: Option<i64>,
@@ -149,8 +152,15 @@ pub fn mint_access_token(issuer_key: &KeyKit, opts: &TokenOpts) -> String {
         );
     }
     if !opts.omit_cnf {
+        let mut cnf = Map::new();
         if let Some(jkt) = &opts.cnf_jkt {
-            claims.insert("cnf".into(), json!({ "jkt": jkt }));
+            cnf.insert("jkt".into(), json!(jkt));
+        }
+        if let Some(x5t) = &opts.cnf_x5t_s256 {
+            cnf.insert("x5t#S256".into(), json!(x5t));
+        }
+        if !cnf.is_empty() {
+            claims.insert("cnf".into(), Value::Object(cnf));
         }
     }
     let iat = opts.issued_at.unwrap_or_else(now);

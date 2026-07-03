@@ -45,6 +45,7 @@ fn accepts_rs256_token_with_es256_proof() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -73,6 +74,7 @@ fn rejects_forged_rs256_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap_err();
     assert_eq!(err.status(), 401);
