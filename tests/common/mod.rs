@@ -177,6 +177,12 @@ pub fn ath(token: &str) -> String {
     b64url(&Sha256::digest(token.as_bytes()))
 }
 
+/// A well-formed RFC 8705 §3.1 `x5t#S256` certificate thumbprint for tests: `base64url(SHA-256(seed))`
+/// — a 32-byte SHA-256 hash, base64url-no-pad (43 chars), the exact shape the verifier requires.
+pub fn cert_thumbprint(seed: &str) -> String {
+    b64url(&Sha256::digest(seed.as_bytes()))
+}
+
 /// Options for minting a DPoP proof.
 #[derive(Default)]
 pub struct ProofOpts {

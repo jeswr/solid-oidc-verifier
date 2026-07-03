@@ -8,8 +8,8 @@
 //!   - cert-bound token + NO presented cert                      → REJECT (never accepted bare);
 //!   - cert-bound token + WRONG presented cert                   → REJECT;
 //!   - DPoP (`cnf.jkt`) token                                    → UNCHANGED (still needs a proof);
-//!   - token carrying BOTH confirmations                         → REJECT (ambiguous/malformed);
-//!   - malformed / empty `cnf.x5t#S256`                          → treated as absent (fail-closed);
+//!   - token carrying BOTH confirmations                         → REJECT (ambiguous);
+//!   - malformed / empty / wrong-shape `cnf.x5t#S256`            → REJECT (fail-closed, no downgrade);
 //!   - no downgrade EITHER direction: a cert-bound token is never provable by a DPoP proof, and a
 //!     DPoP-bound token is never provable by a presented certificate.
 
@@ -23,10 +23,14 @@ use solid_oidc_verifier::verifier::{AuthRequest, Confirmation, Verifier};
 const URL: &str = "https://pod.example/alice/data";
 const METHOD: &str = "GET";
 
-/// A realistic RFC 8705 `x5t#S256`: base64url(SHA-256) of some DER — here just a fixed 43-char value.
-const CERT_X5T: &str = "Zk8oPq2s3v4w5x6y7z8A9B0C1D2E3F4G5H6I7J8K9L0";
-/// A DIFFERENT certificate thumbprint (one character changed → a distinct, unrelated cert).
-const WRONG_X5T: &str = "ak8oPq2s3v4w5x6y7z8A9B0C1D2E3F4G5H6I7J8K9L0";
+/// A well-formed cert thumbprint (32-byte base64url SHA-256).
+fn cert_x5t() -> String {
+    cert_thumbprint("client-cert-a")
+}
+/// A DIFFERENT well-formed cert thumbprint.
+fn wrong_x5t() -> String {
+    cert_thumbprint("client-cert-b")
+}
 
 fn config(require_dpop: bool) -> VerifierConfig {
     VerifierConfig::new(vec![ISSUER.to_string()], AUDIENCE).require_dpop(require_dpop)
@@ -88,18 +92,19 @@ fn assert_401(
 fn accepts_cert_bound_token_with_matching_cert() {
     let issuer = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let cert = cert_x5t();
+    let token = cert_bound_token(&issuer, &cert);
     let creds = v
-        .verify(&cert_request(&token, Some(CERT_X5T)))
+        .verify(&cert_request(&token, Some(&cert)))
         .expect("cert-bound token with matching cert must be accepted");
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
     assert_eq!(creds.issuer.as_deref(), Some(ISSUER));
     // The confirmation surfaced is the certificate binding — NOT a jkt.
     assert_eq!(
         creds.confirmation,
-        Some(Confirmation::X5tS256(CERT_X5T.to_string()))
+        Some(Confirmation::X5tS256(cert.clone()))
     );
-    assert_eq!(creds.cert_x5t_s256(), Some(CERT_X5T));
+    assert_eq!(creds.cert_x5t_s256(), Some(cert.as_str()));
     assert_eq!(creds.cnf_jkt(), None);
 }
 
@@ -109,18 +114,19 @@ fn accepts_cert_bound_token_when_dpop_not_required_bearer_scheme() {
     // MUST-match. (Documents the scheme interaction; the DPoP-required scheme gate is untouched.)
     let issuer = KeyKit::generate();
     let v = build_verifier(&issuer, config(false));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let cert = cert_x5t();
+    let token = cert_bound_token(&issuer, &cert);
     let req = AuthRequest {
         authorization: Some(format!("Bearer {token}")),
         dpop: None,
         method: METHOD.into(),
         url: URL.into(),
-        client_cert_x5t_s256: Some(CERT_X5T.to_string()),
+        client_cert_x5t_s256: Some(cert.clone()),
     };
     let creds = v
         .verify(&req)
         .expect("cert-bound Bearer token accepted when dpop not required");
-    assert_eq!(creds.cert_x5t_s256(), Some(CERT_X5T));
+    assert_eq!(creds.cert_x5t_s256(), Some(cert.as_str()));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -131,7 +137,7 @@ fn accepts_cert_bound_token_when_dpop_not_required_bearer_scheme() {
 fn rejects_cert_bound_token_with_no_presented_cert() {
     let issuer = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let token = cert_bound_token(&issuer, &cert_x5t());
     // No client certificate on the connection ⇒ NEVER accepted bare.
     assert_401(
         &v,
@@ -144,32 +150,60 @@ fn rejects_cert_bound_token_with_no_presented_cert() {
 fn rejects_cert_bound_token_with_wrong_cert() {
     let issuer = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let token = cert_bound_token(&issuer, &cert_x5t());
     assert_401(
         &v,
-        &cert_request(&token, Some(WRONG_X5T)),
+        &cert_request(&token, Some(&wrong_x5t())),
         "confirmation mismatch",
     );
 }
 
 #[test]
-fn rejects_cert_bound_token_with_prefix_or_length_variant_cert() {
-    // A presented value that is a prefix / longer / empty must all fail (constant-time compare also
-    // fails on length mismatch).
+fn rejects_cert_bound_token_with_length_or_bitflip_variant_cert() {
+    // A presented value that is truncated / extended / empty / a single-char flip must all fail (the
+    // constant-time compare also fails on a length mismatch).
     let issuer = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let cert = cert_x5t();
+    let token = cert_bound_token(&issuer, &cert);
+    let first = cert.chars().next().unwrap();
+    let flipped = if first == 'A' { 'B' } else { 'A' };
+    let bit_flip = format!("{}{}", flipped, &cert[1..]);
     for bad in [
-        "",                              // empty
-        &CERT_X5T[..CERT_X5T.len() - 1], // truncated (length differs)
-        &format!("{CERT_X5T}A"),         // extended (length differs)
-        &CERT_X5T.replacen('Z', "z", 1), // single-char case flip
+        "".to_string(),                     // empty
+        cert[..cert.len() - 1].to_string(), // truncated (length differs)
+        format!("{cert}A"),                 // extended (length differs)
+        bit_flip,                           // single-char change
     ] {
         assert_401(
             &v,
-            &cert_request(&token, Some(bad)),
+            &cert_request(&token, Some(&bad)),
             "confirmation mismatch",
         );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fail-closed: malformed cnf.x5t#S256 in the TOKEN (no downgrade, even with require_dpop=false)
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn rejects_token_with_malformed_x5t_even_when_dpop_not_required() {
+    // A token declaring a cert confirmation the issuer INTENDED must never be silently accepted as a
+    // bare token. Both empty and wrong-shape values fail closed, and crucially with require_dpop=false
+    // (the downgrade path) AND a matching-looking cert presented.
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(false));
+    for bad in ["", "not-base64!!", "YWJj" /* only 3 bytes */] {
+        let token = cert_bound_token(&issuer, bad);
+        let req = AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_x5t()),
+        };
+        assert_401(&v, &req, "malformed");
     }
 }
 
@@ -184,7 +218,7 @@ fn no_downgrade_cert_bound_token_not_provable_by_dpop_proof() {
     let issuer = KeyKit::generate();
     let attacker = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
-    let token = cert_bound_token(&issuer, CERT_X5T);
+    let token = cert_bound_token(&issuer, &cert_x5t());
     // A syntactically valid DPoP proof over this request, signed by the attacker's key.
     let proof = mint_dpop_proof(
         &attacker,
@@ -226,7 +260,7 @@ fn no_downgrade_dpop_token_not_provable_by_presented_cert() {
         dpop: None, // no proof
         method: METHOD.into(),
         url: URL.into(),
-        client_cert_x5t_s256: Some(CERT_X5T.to_string()), // a cert IS presented
+        client_cert_x5t_s256: Some(cert_x5t()), // a cert IS presented
     };
     // The token is DPoP-bound ⇒ a proof is still required; the cert is irrelevant.
     assert_401(&v, &req, "dpop proof is required");
@@ -261,7 +295,7 @@ fn no_downgrade_dpop_token_not_provable_by_cert_equal_to_jkt() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn dpop_happy_path_unchanged_with_and_without_presented_cert() {
+fn dpop_happy_path_unchanged_with_presented_cert() {
     let issuer = KeyKit::generate();
     let client = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
@@ -287,7 +321,7 @@ fn dpop_happy_path_unchanged_with_and_without_presented_cert() {
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
-        client_cert_x5t_s256: Some(CERT_X5T.to_string()),
+        client_cert_x5t_s256: Some(cert_x5t()),
     };
     let creds = v
         .verify(&req)
@@ -303,15 +337,16 @@ fn dpop_happy_path_unchanged_with_and_without_presented_cert() {
 #[test]
 fn rejects_token_with_both_cnf_jkt_and_x5t_s256() {
     // Even with BOTH a matching cert AND a valid DPoP proof, a token asserting two confirmation
-    // methods is malformed/ambiguous and rejected — we never "pick one".
+    // methods is ambiguous and rejected — we never "pick one".
     let issuer = KeyKit::generate();
     let client = KeyKit::generate();
     let v = build_verifier(&issuer, config(true));
+    let cert = cert_x5t();
     let token = mint_access_token(
         &issuer,
         &TokenOpts {
             cnf_jkt: Some(client.thumbprint.clone()),
-            cnf_x5t_s256: Some(CERT_X5T.to_string()),
+            cnf_x5t_s256: Some(cert.clone()),
             ..Default::default()
         },
     );
@@ -329,66 +364,28 @@ fn rejects_token_with_both_cnf_jkt_and_x5t_s256() {
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
-        client_cert_x5t_s256: Some(CERT_X5T.to_string()),
+        client_cert_x5t_s256: Some(cert),
     };
     assert_401(&v, &req, "ambiguous");
 }
 
 // ---------------------------------------------------------------------------------------------
-// Malformed / empty x5t#S256 → treated as absent (no confirmation)
-// ---------------------------------------------------------------------------------------------
-
-#[test]
-fn empty_x5t_s256_is_treated_as_absent() {
-    // An empty-string cnf member binds nothing ⇒ the token has no confirmation ⇒ with require_dpop it
-    // is rejected as not-DPoP-bound (NOT silently accepted as cert-bound to the empty string).
-    let issuer = KeyKit::generate();
-    let v = build_verifier(&issuer, config(true));
-    let token = mint_access_token(
-        &issuer,
-        &TokenOpts {
-            cnf_x5t_s256: Some(String::new()),
-            ..Default::default()
-        },
-    );
-    // Present a proof-less DPoP request; empty x5t ⇒ no binding ⇒ "not DPoP-bound".
-    assert_401(
-        &v,
-        &cert_request(&token, Some(CERT_X5T)),
-        "dpop proof is required",
-    );
-}
-
-#[test]
-fn empty_x5t_with_no_cert_and_no_proof_is_not_dpop_bound() {
-    let issuer = KeyKit::generate();
-    let v = build_verifier(&issuer, config(true));
-    let token = mint_access_token(
-        &issuer,
-        &TokenOpts {
-            cnf_x5t_s256: Some(String::new()),
-            ..Default::default()
-        },
-    );
-    assert_401(&v, &cert_request(&token, None), "dpop proof is required");
-}
-
-// ---------------------------------------------------------------------------------------------
-// Multi-key isolation: a cert-bound token from one issuer key does not verify under another.
+// Signature is still enforced on the cert-bound path
 // ---------------------------------------------------------------------------------------------
 
 #[test]
 fn cert_bound_token_signature_still_verified() {
     // The certificate binding is IN ADDITION to the signature check: a cert-bound token signed by a
-    // key the verifier does not trust is rejected before the cert compare even matters.
+    // key the verifier does not trust is rejected even with a matching presented certificate.
     let real_issuer = KeyKit::generate();
     let forger = KeyKit::generate();
     let v = build_verifier(&real_issuer, config(true));
+    let cert = cert_x5t();
     // Token signed by the FORGER but claiming the trusted issuer, cert-bound + matching cert.
-    let token = cert_bound_token(&forger, CERT_X5T);
+    let token = cert_bound_token(&forger, &cert);
     assert_401(
         &v,
-        &cert_request(&token, Some(CERT_X5T)),
+        &cert_request(&token, Some(&cert)),
         "verification failed",
     );
 }

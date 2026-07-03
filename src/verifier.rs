@@ -661,34 +661,78 @@ fn ath(token: &str) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
 }
 
+/// The state of one `cnf` confirmation member: absent, a valid value, or present-but-malformed.
+enum CnfMember<'a> {
+    /// The member key is not present in the `cnf` object — that method simply isn't used.
+    Absent,
+    /// A well-formed confirmation value.
+    Value(&'a str),
+    /// The key is present but the value is empty / not a string / the wrong shape — the issuer put it
+    /// there, so it is a malformed token, NOT "no confirmation".
+    Malformed,
+}
+
+/// Read a `cnf` member, treating a present-but-invalid value as [`CnfMember::Malformed`] (fail-closed)
+/// rather than as absent. `shape_ok` additionally constrains a non-empty string value.
+fn read_cnf_member<'a>(
+    cnf: &'a serde_json::Map<String, Value>,
+    key: &str,
+    shape_ok: impl Fn(&str) -> bool,
+) -> CnfMember<'a> {
+    match cnf.get(key) {
+        None => CnfMember::Absent,
+        Some(v) => match v.as_str() {
+            Some(s) if !s.is_empty() && shape_ok(s) => CnfMember::Value(s),
+            _ => CnfMember::Malformed,
+        },
+    }
+}
+
+/// Whether `s` is a base64url-no-pad encoding of exactly 32 bytes — the shape of an RFC 8705 §3.1
+/// `x5t#S256` (the SHA-256 of the certificate DER). Fail-closed: a wrong-length / non-base64url
+/// thumbprint is not a valid certificate confirmation.
+fn is_sha256_thumbprint_b64url(s: &str) -> bool {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s.as_bytes())
+        .map(|b| b.len() == 32)
+        .unwrap_or(false)
+}
+
 /// Parse the token's `cnf` (RFC 7800) confirmation method into a [`Confirmation`].
 ///
-/// - `cnf.jkt` (a non-empty string)        → [`Confirmation::Jkt`] (RFC 9449 DPoP);
-/// - `cnf["x5t#S256"]` (a non-empty string) → [`Confirmation::X5tS256`] (RFC 8705 §3.1 cert-bound);
-/// - neither present                        → `Ok(None)`;
-/// - BOTH present                           → `Err` — ambiguous/malformed, rejected fail-closed
-///   (RFC 8705 §3.1 defines a token as bound to ONE method; a token asserting two confirmations is
-///   not something we choose between).
+/// - `cnf.jkt` (a non-empty string)         → [`Confirmation::Jkt`] (RFC 9449 DPoP);
+/// - `cnf["x5t#S256"]` (a 32-byte base64url thumbprint) → [`Confirmation::X5tS256`] (RFC 8705 §3.1);
+/// - neither key present                    → `Ok(None)` (a genuinely unbound / bare token);
+/// - BOTH present                           → `Err` — ambiguous, rejected fail-closed (RFC 8705 §3.1
+///   binds a token to ONE method; a token asserting two confirmations is not something we choose
+///   between);
+/// - either key present-but-malformed (empty / non-string / — for `x5t#S256` — not a 32-byte
+///   base64url thumbprint) → `Err` — the token declares a confirmation the issuer INTENDED to bind,
+///   so it MUST fail closed, never silently downgrade to a bare token (which, under
+///   `require_dpop(false)`, would otherwise be accepted without any proof-of-possession).
 ///
-/// A `cnf` that is not an object, or whose member is missing / not a non-empty string, means that
-/// member does NOT bind the token (treated as absent) — never a silent downgrade of a real binding.
+/// A `cnf` that is not a JSON object is treated as absent (no recognised binding).
 fn extract_confirmation(claims: &Claims) -> Result<Option<Confirmation>, VerifyError> {
     let cnf = match claims.get("cnf").and_then(Value::as_object) {
         Some(c) => c,
         None => return Ok(None),
     };
-    fn non_empty(v: Option<&Value>) -> Option<&str> {
-        v.and_then(Value::as_str).filter(|s| !s.is_empty())
-    }
-    let jkt = non_empty(cnf.get("jkt"));
-    let x5t = non_empty(cnf.get("x5t#S256"));
+    // jkt: presence + non-empty string only (its VALUE is verified against the proof's computed
+    // thumbprint on the DPoP path — the pre-existing behaviour for well-formed values is unchanged).
+    let jkt = read_cnf_member(cnf, "jkt", |_| true);
+    // x5t#S256: MUST be a 32-byte base64url SHA-256 certificate thumbprint (RFC 8705 §3.1).
+    let x5t = read_cnf_member(cnf, "x5t#S256", is_sha256_thumbprint_b64url);
     match (jkt, x5t) {
-        (Some(_), Some(_)) => Err(invalid_token(
+        // Any present-but-malformed member fails closed BEFORE the ambiguity check.
+        (CnfMember::Malformed, _) | (_, CnfMember::Malformed) => Err(invalid_token(
+            "Access token confirmation (cnf) is malformed.",
+        )),
+        (CnfMember::Value(_), CnfMember::Value(_)) => Err(invalid_token(
             "Access token confirmation is ambiguous (both cnf.jkt and cnf.x5t#S256 present).",
         )),
-        (Some(j), None) => Ok(Some(Confirmation::Jkt(j.to_string()))),
-        (None, Some(t)) => Ok(Some(Confirmation::X5tS256(t.to_string()))),
-        (None, None) => Ok(None),
+        (CnfMember::Value(j), CnfMember::Absent) => Ok(Some(Confirmation::Jkt(j.to_string()))),
+        (CnfMember::Absent, CnfMember::Value(t)) => Ok(Some(Confirmation::X5tS256(t.to_string()))),
+        (CnfMember::Absent, CnfMember::Absent) => Ok(None),
     }
 }
 
@@ -805,52 +849,63 @@ mod tests {
 
     #[test]
     fn extract_confirmation_reads_x5t_s256() {
-        let c = claims_with_cnf(serde_json::json!({ "x5t#S256": "certhash" }));
+        // A valid 32-byte base64url SHA-256 thumbprint (RFC 8705 §3.1 shape).
+        let cert = ath("cert-a");
+        assert!(is_sha256_thumbprint_b64url(&cert));
+        let c = claims_with_cnf(serde_json::json!({ "x5t#S256": cert.clone() }));
         assert_eq!(
             extract_confirmation(&c).unwrap(),
-            Some(Confirmation::X5tS256("certhash".into()))
+            Some(Confirmation::X5tS256(cert))
         );
     }
 
     #[test]
-    fn extract_confirmation_none_when_absent_or_empty() {
+    fn extract_confirmation_none_only_when_truly_absent() {
         // No cnf at all.
         assert_eq!(extract_confirmation(&Claims::new()).unwrap(), None);
-        // cnf present but empty object.
+        // cnf present but with NO recognised member.
         let c = claims_with_cnf(serde_json::json!({}));
         assert_eq!(extract_confirmation(&c).unwrap(), None);
-        // Empty-string members bind nothing.
-        let c = claims_with_cnf(serde_json::json!({ "jkt": "", "x5t#S256": "" }));
+        // cnf present with only an unrelated/unsupported member ⇒ no recognised binding.
+        let c = claims_with_cnf(serde_json::json!({ "kid": "abc" }));
         assert_eq!(extract_confirmation(&c).unwrap(), None);
         // cnf is not an object.
         let c = claims_with_cnf(Value::String("nope".into()));
         assert_eq!(extract_confirmation(&c).unwrap(), None);
-        // Non-string member is ignored.
-        let c = claims_with_cnf(serde_json::json!({ "jkt": 42 }));
-        assert_eq!(extract_confirmation(&c).unwrap(), None);
+    }
+
+    #[test]
+    fn extract_confirmation_rejects_malformed_members_fail_closed() {
+        // Empty-string members are MALFORMED, not absent (fail-closed — no downgrade to bare).
+        for cnf in [
+            serde_json::json!({ "jkt": "" }),
+            serde_json::json!({ "x5t#S256": "" }),
+            serde_json::json!({ "jkt": 42 }),      // non-string
+            serde_json::json!({ "x5t#S256": 42 }), // non-string
+            serde_json::json!({ "x5t#S256": "not-base64!!" }), // not base64url
+            serde_json::json!({ "x5t#S256": "YWJj" }), // valid base64url but only 3 bytes
+            serde_json::json!({ "jkt": "", "x5t#S256": ath("cert-a") }), // one malformed, one valid
+        ] {
+            let c = claims_with_cnf(cnf.clone());
+            let err = extract_confirmation(&c).unwrap_err();
+            assert_eq!(err.status(), 401, "cnf {cnf} should be rejected");
+        }
     }
 
     #[test]
     fn extract_confirmation_rejects_both_cnf_present() {
-        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb", "x5t#S256": "certhash" }));
+        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb", "x5t#S256": ath("cert-a") }));
         let err = extract_confirmation(&c).unwrap_err();
         assert_eq!(err.status(), 401);
     }
 
     #[test]
-    fn extract_confirmation_one_empty_one_set_is_unambiguous() {
-        // Empty jkt + real x5t ⇒ cert-bound (the empty member does not count as "present").
-        let c = claims_with_cnf(serde_json::json!({ "jkt": "", "x5t#S256": "certhash" }));
-        assert_eq!(
-            extract_confirmation(&c).unwrap(),
-            Some(Confirmation::X5tS256("certhash".into()))
-        );
-        // Real jkt + empty x5t ⇒ DPoP-bound.
-        let c = claims_with_cnf(serde_json::json!({ "jkt": "thumb", "x5t#S256": "" }));
-        assert_eq!(
-            extract_confirmation(&c).unwrap(),
-            Some(Confirmation::Jkt("thumb".into()))
-        );
+    fn is_sha256_thumbprint_b64url_accepts_32_bytes_only() {
+        assert!(is_sha256_thumbprint_b64url(&ath("anything"))); // 32-byte SHA-256, base64url
+        assert!(!is_sha256_thumbprint_b64url("")); // empty
+        assert!(!is_sha256_thumbprint_b64url("YWJj")); // 3 bytes
+        assert!(!is_sha256_thumbprint_b64url("not base64!")); // invalid alphabet
+        assert!(!is_sha256_thumbprint_b64url(&format!("{}==", ath("x")))); // padded (rejected)
     }
 
     #[test]
