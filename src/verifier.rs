@@ -46,7 +46,26 @@ pub struct AuthRequest {
     pub url: String,
 }
 
+/// The RFC 8705 §3.1 `cnf.x5t#S256` mTLS certificate-thumbprint confirmation as read off a verified
+/// token. THREE states — so a caller (e.g. a PoP-method dispatch) can tell an ABSENT binding from a
+/// PRESENT-but-MALFORMED one. That distinction is load-bearing: a malformed binding must fail closed
+/// (a cert-bound token whose thumbprint is unreadable is NOT the same as an unbound token), so it is
+/// never collapsed to `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum X5tS256 {
+    /// A well-formed value: the base64url-no-pad encoding of a 32-byte SHA-256 certificate hash.
+    /// Carries the raw base64url string exactly as it appeared in the token (not re-encoded).
+    Thumbprint(String),
+    /// The `cnf.x5t#S256` claim is present but malformed — not a JSON string, empty, not base64url,
+    /// or not exactly 32 decoded bytes. Downstream cert-bound dispatch MUST fail closed on this.
+    Malformed,
+}
+
 /// The verified caller identity (TS `Credentials`). Public (unauthenticated) when `web_id` is `None`.
+///
+/// Produced by [`Verifier::verify`]; consumers read its fields (they do not construct it via a
+/// struct literal). Surfacing a further verified claim — this adds `cnf_x5t_s256` beside `cnf_jkt` —
+/// is an additive field, acceptable for this pre-1.0 (0.x) EXPERIMENTAL crate under SemVer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct VerifiedToken {
     /// The agent's WebID (an `https:` URL). `None` ⇒ a public/unauthenticated request.
@@ -57,8 +76,13 @@ pub struct VerifiedToken {
     pub client_id: Option<String>,
     /// The granted `scope` (space-delimited), if present.
     pub scopes: Vec<String>,
-    /// The `cnf.jkt` thumbprint the token is bound to, if DPoP-bound.
+    /// The `cnf.jkt` thumbprint the token is bound to, if DPoP-bound (RFC 9449).
     pub cnf_jkt: Option<String>,
+    /// The `cnf.x5t#S256` mTLS certificate-thumbprint binding, if the token carries one (RFC 8705).
+    /// INDEPENDENT of [`cnf_jkt`](Self::cnf_jkt): a token carrying BOTH is surfaced with both set —
+    /// the verifier never drops or merges them; deciding a multi-binding token is refused is the
+    /// downstream PoP dispatch's job, which needs both fields readable to make that call.
+    pub cnf_x5t_s256: Option<X5tS256>,
     /// The `exp` (epoch seconds), if present.
     pub expiry: Option<i64>,
 }
@@ -71,6 +95,17 @@ impl VerifiedToken {
 
     pub fn is_public(&self) -> bool {
         self.web_id.is_none()
+    }
+
+    /// The raw base64url `cnf.x5t#S256` thumbprint string when the token carries a WELL-FORMED mTLS
+    /// certificate binding, else `None`. Convenience over [`cnf_x5t_s256`](Self::cnf_x5t_s256): it
+    /// deliberately collapses `Malformed` to `None`, so a caller that needs to distinguish
+    /// absent-vs-malformed (to fail closed) MUST read the field, not this accessor.
+    pub fn cnf_x5t_s256_thumbprint(&self) -> Option<&str> {
+        match &self.cnf_x5t_s256 {
+            Some(X5tS256::Thumbprint(t)) => Some(t.as_str()),
+            _ => None,
+        }
     }
 }
 
@@ -170,6 +205,7 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
                 .map(|s| s.split_whitespace().map(str::to_string).collect())
                 .unwrap_or_default(),
             cnf_jkt: extract_cnf_jkt(&claims),
+            cnf_x5t_s256: extract_cnf_x5t_s256(&claims),
             expiry: claims.get("exp").and_then(Value::as_i64),
         })
     }
@@ -548,6 +584,37 @@ fn extract_cnf_jkt(claims: &Claims) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Extract the RFC 8705 §3.1 `cnf.x5t#S256` mTLS certificate-thumbprint confirmation from claims.
+///
+/// - `None`                        — no `cnf` object, or a `cnf` without an `x5t#S256` member (ABSENT).
+/// - `Some(X5tS256::Thumbprint(s))` — a well-formed value: base64url-no-pad of a 32-byte SHA-256 hash.
+/// - `Some(X5tS256::Malformed)`     — the member is present but not a valid 32-byte base64url-no-pad
+///   value (non-string, empty, bad alphabet/padding, or wrong length).
+///
+/// A present-but-malformed value is NEVER collapsed to `None`, so the caller can fail closed rather
+/// than treat a broken cert binding as an unbound token. Reads `cnf.jkt` and `cnf.x5t#S256`
+/// independently — a token carrying both is surfaced with both (no drop, no merge).
+fn extract_cnf_x5t_s256(claims: &Claims) -> Option<X5tS256> {
+    let raw = claims
+        .get("cnf")
+        .and_then(Value::as_object)
+        .and_then(|cnf| cnf.get("x5t#S256"))?;
+    // From here the member is PRESENT: every failure path yields `Malformed`, never `None`.
+    match raw.as_str() {
+        Some(s) if is_valid_x5t_s256(s) => Some(X5tS256::Thumbprint(s.to_string())),
+        _ => Some(X5tS256::Malformed),
+    }
+}
+
+/// Whether `s` is a well-formed RFC 8705 `x5t#S256`: the base64url (no padding) encoding of a 32-byte
+/// SHA-256 certificate digest. Fail-closed on any decode error or wrong length; never panics.
+fn is_valid_x5t_s256(s: &str) -> bool {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(s)
+        .map(|bytes| bytes.len() == 32)
+        .unwrap_or(false)
+}
+
 /// Whether the configured audience is present in the token's `aud` (a string or an array). RFC 9068.
 fn audience_matches(claims: &Claims, audience: &str) -> bool {
     match claims.get("aud") {
@@ -633,5 +700,122 @@ mod tests {
         cnf.insert("jkt".into(), Value::String("thumb".into()));
         c.insert("cnf".into(), Value::Object(cnf));
         assert_eq!(extract_cnf_jkt(&c), Some("thumb".to_string()));
+    }
+
+    // ---- RFC 8705 cnf.x5t#S256 -------------------------------------------------------------------
+
+    /// A well-formed x5t#S256: base64url-no-pad of an arbitrary 32-byte (SHA-256-sized) digest.
+    fn valid_x5t(seed: u8) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([seed; 32])
+    }
+
+    /// Build claims with an optional `cnf.jkt` and optional `cnf.x5t#S256` value (any JSON value).
+    fn claims_with_cnf(jkt: Option<Value>, x5t: Option<Value>) -> Claims {
+        let mut c = Claims::new();
+        if jkt.is_some() || x5t.is_some() {
+            let mut cnf = serde_json::Map::new();
+            if let Some(v) = jkt {
+                cnf.insert("jkt".into(), v);
+            }
+            if let Some(v) = x5t {
+                cnf.insert("x5t#S256".into(), v);
+            }
+            c.insert("cnf".into(), Value::Object(cnf));
+        }
+        c
+    }
+
+    #[test]
+    fn x5t_valid_thumbprint_is_read() {
+        let t = valid_x5t(0xAB);
+        let c = claims_with_cnf(None, Some(Value::String(t.clone())));
+        assert_eq!(extract_cnf_x5t_s256(&c), Some(X5tS256::Thumbprint(t)));
+    }
+
+    #[test]
+    fn x5t_absent_cnf_is_none() {
+        // No `cnf` at all → None for both bindings (never Malformed).
+        let c = Claims::new();
+        assert_eq!(extract_cnf_x5t_s256(&c), None);
+        assert_eq!(extract_cnf_jkt(&c), None);
+    }
+
+    #[test]
+    fn x5t_cnf_without_member_is_none() {
+        // A `cnf` carrying only jkt → x5t is ABSENT (None), not Malformed.
+        let c = claims_with_cnf(Some(Value::String("thumb".into())), None);
+        assert_eq!(extract_cnf_x5t_s256(&c), None);
+    }
+
+    #[test]
+    fn x5t_wrong_length_is_malformed_not_none() {
+        // Valid base64url but only 16 decoded bytes (not the 32-byte SHA-256 length) → Malformed,
+        // and crucially DISTINGUISHABLE from absent.
+        let short = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0u8; 16]);
+        let c = claims_with_cnf(None, Some(Value::String(short)));
+        assert_eq!(extract_cnf_x5t_s256(&c), Some(X5tS256::Malformed));
+    }
+
+    #[test]
+    fn x5t_bad_alphabet_or_padding_is_malformed() {
+        // Non-base64url characters and standard-base64 padding are both rejected as Malformed
+        // (no panic on any input).
+        for bad in ["not valid base64!!!", "###", "AAAA=", "", "   "] {
+            let c = claims_with_cnf(None, Some(Value::String(bad.into())));
+            assert_eq!(
+                extract_cnf_x5t_s256(&c),
+                Some(X5tS256::Malformed),
+                "input {bad:?} should be Malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn x5t_non_string_value_is_malformed() {
+        // A present-but-non-string member (number/object/array/bool/null) is Malformed, never None.
+        let mut nested = serde_json::Map::new();
+        nested.insert("x5t#S256".into(), Value::String(valid_x5t(1)));
+        for v in [
+            Value::Number(42.into()),
+            Value::Bool(true),
+            Value::Null,
+            Value::Array(vec![Value::String(valid_x5t(2))]),
+            Value::Object(nested),
+        ] {
+            let c = claims_with_cnf(None, Some(v));
+            assert_eq!(extract_cnf_x5t_s256(&c), Some(X5tS256::Malformed));
+        }
+    }
+
+    #[test]
+    fn x5t_and_jkt_both_present_are_surfaced_independently() {
+        // No-confusion invariant: a token carrying BOTH bindings exposes both — no drop, no merge.
+        let t = valid_x5t(0x11);
+        let c = claims_with_cnf(
+            Some(Value::String("the-jkt".into())),
+            Some(Value::String(t.clone())),
+        );
+        assert_eq!(extract_cnf_jkt(&c), Some("the-jkt".to_string()));
+        assert_eq!(extract_cnf_x5t_s256(&c), Some(X5tS256::Thumbprint(t)));
+    }
+
+    #[test]
+    fn x5t_thumbprint_accessor_collapses_malformed_to_none() {
+        // The convenience accessor returns Some only for a well-formed thumbprint; Malformed → None.
+        let t = valid_x5t(0x22);
+        let ok = VerifiedToken {
+            cnf_x5t_s256: Some(X5tS256::Thumbprint(t.clone())),
+            ..Default::default()
+        };
+        assert_eq!(ok.cnf_x5t_s256_thumbprint(), Some(t.as_str()));
+
+        let malformed = VerifiedToken {
+            cnf_x5t_s256: Some(X5tS256::Malformed),
+            ..Default::default()
+        };
+        assert_eq!(malformed.cnf_x5t_s256_thumbprint(), None);
+
+        let absent = VerifiedToken::default();
+        assert_eq!(absent.cnf_x5t_s256_thumbprint(), None);
     }
 }
