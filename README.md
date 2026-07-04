@@ -146,9 +146,12 @@ let req = AuthRequest {
 match verifier.verify(&req) {
     Ok(token) if token.is_public() => { /* unauthenticated — serve public resources only */ }
     Ok(token) => {
-        let _webid = token.web_id;       // the authenticated agent
-        let _issuer = token.issuer;
-        let _jkt = token.cnf_jkt;
+        let _webid = &token.web_id;       // the authenticated agent
+        let _issuer = &token.issuer;
+        let _jkt = &token.cnf_jkt;                     // RFC 9449 DPoP thumbprint binding
+        let _x5t = &token.cnf_x5t_s256;                // RFC 8705 mTLS cert-thumbprint binding
+                                                       // (Some(Thumbprint)/Some(Malformed)/None)
+        let _x5t_ok = token.cnf_x5t_s256_thumbprint(); // Option<&str>: valid thumbprint only
     }
     Err(e) => {
         let _status = e.status();                       // 401 (auth) or 503 (replay store down)
@@ -164,6 +167,7 @@ match verifier.verify(&req) {
 | Access-token RFC-9068 validation | ✅ implemented + tested | — |
 | DPoP RFC-9449 proof validation | ✅ implemented + tested | — |
 | RFC 7638 `cnf.jkt` thumbprint | ✅ implemented + tested | — |
+| RFC 8705 `cnf.x5t#S256` mTLS binding (surfaced only — three-state absent/valid/malformed; not verified here) | ✅ accessor + tested | — |
 | `ath` three-state compat | ✅ implemented + tested | — |
 | `jti` replay (trait + in-memory: atomic check-and-set, never-evict-live, fail-closed at capacity) | ✅ implemented + tested | shared Redis `SET NX` impl (`ReplayStore`) |
 | SSRF address classifier + URL gate | ✅ implemented + tested | — |

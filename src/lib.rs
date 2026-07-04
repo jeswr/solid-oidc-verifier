@@ -123,7 +123,7 @@ pub use ssrf::{
     is_loopback_address, is_public_address, is_public_address_with_nat64, Nat64Nsp, Nat64NspError,
     Nat64Policy,
 };
-pub use verifier::{AuthRequest, VerifiedToken, Verifier};
+pub use verifier::{AuthRequest, VerifiedToken, Verifier, X5tS256};
 #[cfg(feature = "network")]
 pub use webid::NetworkWebIdResolver;
 pub use webid::{
