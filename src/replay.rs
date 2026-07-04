@@ -261,6 +261,73 @@ mod tests {
         }
     }
 
+    /// A deterministic monotonic clock that *signals the exact moment its time value is read*. It exists
+    /// to pin the `contains()` "sample the clock AFTER the lock" ordering with NO `thread::sleep` — see
+    /// [`contains_samples_clock_after_lock_so_expiry_under_contention_reads_false`].
+    ///
+    /// `now()` CAPTURES the current time value FIRST, then — on the first read after [`arm`](Self::arm) —
+    /// sends a one-shot signal on `read_tx`. Capturing the value *before* signalling is the load-bearing
+    /// detail: it gives the test a happens-before edge. When the main thread receives the signal it may
+    /// advance the clock, and that advance is then guaranteed to be ordered strictly AFTER the value this
+    /// read returned. So a probe that reads the clock BEFORE taking the lock (the stale-now bug) observes
+    /// the pre-advance, still-live value, while the fixed code reads AFTER the lock (past the advance) and
+    /// observes the expired value. Time only moves when the test moves it (`advance`), so there is zero
+    /// scheduler-jitter flake. (Monotonic-safe — `offset` only ever increases.)
+    struct SignalingClock {
+        base: Instant,
+        offset: StdMutex<Duration>,
+        armed: std::sync::atomic::AtomicBool,
+        fired: std::sync::atomic::AtomicBool,
+        read_tx: StdMutex<Option<std::sync::mpsc::Sender<()>>>,
+    }
+
+    impl SignalingClock {
+        fn new(read_tx: std::sync::mpsc::Sender<()>) -> Self {
+            Self {
+                base: Instant::now(),
+                offset: StdMutex::new(Duration::ZERO),
+                armed: std::sync::atomic::AtomicBool::new(false),
+                fired: std::sync::atomic::AtomicBool::new(false),
+                read_tx: StdMutex::new(Some(read_tx)),
+            }
+        }
+
+        fn advance(&self, by: Duration) {
+            let mut o = self.offset.lock().unwrap();
+            *o += by;
+        }
+
+        /// Arm the one-shot: the NEXT `now()` read signals `read_tx` (after capturing its value).
+        fn arm(&self) {
+            self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl Clock for SignalingClock {
+        fn now(&self) -> Instant {
+            // Capture the time value FIRST so the signal — and any advance the main thread makes upon
+            // receiving it — is strictly ordered AFTER the value this call returns.
+            let value = self.base + *self.offset.lock().unwrap();
+            if self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                if let Some(tx) = self.read_tx.lock().unwrap().take() {
+                    let _ = tx.send(());
+                }
+            }
+            value
+        }
+    }
+
+    /// `Arc<SignalingClock>` wrapper so the store can own a `Clock` while the test retains a handle to
+    /// arm/advance it (mirrors [`ArcClock`]).
+    struct ArcSignalingClock(std::sync::Arc<SignalingClock>);
+    impl Clock for ArcSignalingClock {
+        fn now(&self) -> Instant {
+            self.0.now()
+        }
+    }
+
     #[test]
     fn first_mark_is_new_second_is_replay() {
         let store = InMemoryReplayStore::with_window(Duration::from_secs(305));
@@ -539,19 +606,39 @@ mod tests {
 
     #[test]
     fn contains_samples_clock_after_lock_so_expiry_under_contention_reads_false() {
+        use std::sync::mpsc;
         use std::sync::Arc;
         // Pins the stale-now fix: `contains()` MUST sample the clock AFTER acquiring the mutex, so an
         // entry that expires WHILE the prober is blocked on lock contention reads as `false` (not a
-        // spurious false-positive replay). We reproduce "blocked past expiry" deterministically: the
-        // test thread holds the store's lock, the prober thread calls `contains()` and parks on
-        // `inner.lock()`, we advance the fake clock past the entry's expiry WHILE it is parked, then
-        // release the lock. Because `now` is read after the lock is acquired, the prober evaluates
-        // expiry against the ADVANCED (post-expiry) time → `false`.
+        // spurious false-positive replay). This is FULLY DETERMINISTIC — no `thread::sleep`. A
+        // [`SignalingClock`] tells the main thread the exact instant the prober's `contains()` reads the
+        // clock; the main thread then advances the clock past expiry and releases the lock. The whole
+        // scenario is driven by a channel + the store's own mutex, so it cannot flake in either
+        // direction:
         //
-        // Mutation-check: revert the fix (read `now` before `inner.lock()`) and the prober samples the
-        // pre-advance time (still within the window) → `true` → this assertion fails.
-        let clock = Arc::new(FakeClock::new());
-        let store = Arc::new(store_with(100_000, Arc::clone(&clock)));
+        //   * CORRECT code (reads the clock AFTER the lock): the main thread ADVANCES the clock while
+        //     still holding the store lock, then drops it. The prober can only read the clock once it
+        //     acquires that lock — which the mutex's release-ordering forces to happen strictly AFTER
+        //     the advance. So the prober always observes the expired value → `false`. This holds no
+        //     matter what the recv timeout below is: the timeout only bounds how long the main thread
+        //     waits for a signal that, for the correct code, never arrives pre-lock (the prober's read
+        //     is gated behind the still-held lock). It never causes a false failure.
+        //
+        //   * BUGGY code (reads the clock BEFORE the lock): the prober's pre-lock read fires the signal
+        //     and captures the still-live value. The main thread receives the signal and only THEN
+        //     advances — the happens-before edge guarantees the prober's captured value is pre-advance
+        //     (live). The prober then blocks on the lock, we release it, and it computes `true`, so the
+        //     `!observed` assertion fails and the mutation is caught. This uses NO timing slack: the
+        //     buffered signal resolves the recv immediately, so a too-short timeout can never mask it.
+        //
+        // The recv timeout is therefore a pure deadlock-breaker for the correct-code path, with ZERO
+        // effect on the correctness of either verdict.
+        let (read_tx, read_rx) = mpsc::channel::<()>();
+        let clock = Arc::new(SignalingClock::new(read_tx));
+        let store = Arc::new(InMemoryReplayStore::with_clock(
+            100_000,
+            ArcSignalingClock(Arc::clone(&clock)),
+        ));
         let ttl = Duration::from_secs(20);
         assert_eq!(store.mark("contended", ttl).unwrap(), MarkResult::New);
         assert!(
@@ -559,18 +646,28 @@ mod tests {
             "the entry is live before any contention"
         );
 
+        // Arm the one-shot: from here, the prober's `contains()` clock read is the only signalling read
+        // (the setup `mark`/`contains` above ran unarmed).
+        clock.arm();
+
         // Hold the store's lock so the prober must block on `inner.lock()`.
         let guard = store.inner.lock().unwrap();
 
         let probe_store = Arc::clone(&store);
         let prober = std::thread::spawn(move || probe_store.contains("contended").unwrap());
 
-        // Give the prober time to actually reach (and park on) `inner.lock()`. Then advance the clock
-        // PAST the entry's expiry — simulating the wall-clock moving on while the call is blocked.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Wait for the prober's discriminating clock read to CAPTURE its value. For buggy code that read
+        // is pre-lock, so the signal arrives here and we advance strictly after it (happens-before). For
+        // correct code the read is behind our still-held lock, so no signal arrives and we fall through
+        // after a bounded wait — either way the next line advances BEFORE we drop the lock, keeping the
+        // correct-code verdict deterministic. The bound is a generous deadlock-breaker, not a timing
+        // assumption: the buggy signal is buffered and resolves the recv in microseconds.
+        let _ = read_rx.recv_timeout(Duration::from_millis(500));
+
+        // Advance the clock PAST the entry's expiry.
         clock.advance(Duration::from_secs(60));
 
-        // Release the lock; the prober now acquires it and (post-fix) samples the advanced clock.
+        // Release the lock; the prober now acquires it and (correct code) samples the advanced clock.
         drop(guard);
 
         let observed = prober.join().unwrap();
