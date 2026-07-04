@@ -55,6 +55,7 @@ fn dpop_request(issuer_key: &KeyKit, client: &KeyKit) -> AuthRequest {
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
+        client_cert_x5t_s256: None,
     }
 }
 
@@ -118,6 +119,7 @@ fn returns_public_credentials_when_no_authorization() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert!(creds.is_public());
@@ -155,6 +157,7 @@ fn propagates_custom_webid_claim_name() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -171,6 +174,7 @@ fn accepts_bearer_when_dpop_not_required() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -207,6 +211,7 @@ fn exposes_scopes_and_expiry() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(
@@ -257,6 +262,7 @@ fn rejects_forged_signature() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -291,6 +297,7 @@ fn rejects_untrusted_issuer() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "issuer is not trusted",
     );
@@ -325,6 +332,7 @@ fn rejects_missing_webid_claim() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "webid",
     );
@@ -359,6 +367,7 @@ fn rejects_non_https_webid() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "https",
     );
@@ -393,6 +402,7 @@ fn rejects_non_url_webid() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "not a valid url",
     );
@@ -427,6 +437,7 @@ fn rejects_webid_with_userinfo() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "userinfo",
     );
@@ -463,6 +474,7 @@ fn rejects_expired_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -498,6 +510,7 @@ fn rejects_future_nbf_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -534,6 +547,7 @@ fn rejects_future_iat_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -568,6 +582,7 @@ fn rejects_wrong_audience() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -602,6 +617,7 @@ fn rejects_missing_audience() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -649,6 +665,7 @@ fn rejects_missing_required_claims() {
                 dpop: Some(proof),
                 method: METHOD.into(),
                 url: URL.into(),
+                client_cert_x5t_s256: None,
             },
             "missing",
         );
@@ -686,6 +703,7 @@ fn rejects_hs256_access_token_alg_confusion() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -720,6 +738,7 @@ fn rejects_alg_none_access_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -759,6 +778,7 @@ fn rejects_es512_access_token_known_narrowing() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "es512",
     );
@@ -775,6 +795,7 @@ fn rejects_malformed_token() {
             dpop: Some("x".into()),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -803,6 +824,7 @@ fn rejects_bearer_when_dpop_required() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "bearer not accepted",
     );
@@ -827,6 +849,7 @@ fn rejects_when_proof_header_absent() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "dpop proof is required",
     );
@@ -855,6 +878,7 @@ fn rejects_token_not_dpop_bound() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "not dpop-bound",
     );
@@ -889,6 +913,7 @@ fn rejects_htm_mismatch() {
             dpop: Some(proof),
             method: "GET".into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "htm",
     );
@@ -923,6 +948,7 @@ fn accepts_case_insensitive_htm() {
             dpop: Some(proof),
             method: "GET".into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -957,6 +983,7 @@ fn rejects_htu_mismatch_path() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "htu",
     );
@@ -991,6 +1018,7 @@ fn rejects_htu_mismatch_host() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "htu",
     );
@@ -1024,6 +1052,7 @@ fn accepts_htu_default_port_normalisation() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: "https://pod.example/alice/data".into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -1057,6 +1086,7 @@ fn accepts_htu_with_query_in_proof_stripped() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -1083,6 +1113,7 @@ fn rejects_proof_without_ath_strict() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "ath",
     );
@@ -1116,6 +1147,7 @@ fn rejects_proof_with_wrong_ath() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "ath",
     );
@@ -1156,6 +1188,7 @@ fn rejects_ath_for_different_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "ath",
     );
@@ -1201,6 +1234,7 @@ fn rejects_cnf_jkt_mismatch() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "confirmation mismatch",
     );
@@ -1236,6 +1270,7 @@ fn rejects_stale_proof_iat() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "recent enough",
     );
@@ -1271,6 +1306,7 @@ fn rejects_future_proof_iat() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "recent enough",
     );
@@ -1314,6 +1350,7 @@ fn accepts_future_skewed_proof_within_symmetric_window() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .expect("a future-skewed proof inside the symmetric window must be accepted");
     assert_eq!(out.web_id.as_deref(), Some(WEBID));
@@ -1352,6 +1389,7 @@ fn future_skewed_proof_jti_is_recorded_and_replay_rejected() {
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
+        client_cert_x5t_s256: None,
     };
     v.verify(&req)
         .expect("first use of the future-skewed proof must be accepted");
@@ -1390,6 +1428,7 @@ fn symmetric_window_future_boundary() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         }
     };
     // Just inside the +305s edge (use 300 to stay clear of the 1s wall-clock tick) → accepted.
@@ -1428,6 +1467,7 @@ fn rejects_wrong_proof_typ() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "typ",
     );
@@ -1465,6 +1505,7 @@ fn rejects_proof_embedding_private_key() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "private",
     );
@@ -1499,6 +1540,7 @@ fn rejects_proof_hs256() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -1515,6 +1557,7 @@ fn rejects_unsupported_scheme() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "unsupported authorization scheme",
     );
@@ -1549,6 +1592,7 @@ fn rejects_proof_without_jwk_header() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -1596,6 +1640,7 @@ fn multi_issuer_no_cross_acceptance() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -1646,6 +1691,7 @@ fn jwks_failure_request() -> (Verifier<FailingProvider, InMemoryReplayStore>, Au
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
     )
 }
@@ -1766,6 +1812,7 @@ fn rejects_unlisted_authorized_party() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "authorized party",
     );
@@ -1800,6 +1847,7 @@ fn accepts_listed_authorized_party_via_azp() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -1828,6 +1876,7 @@ fn challenge_names_trusted_issuer() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap_err();
     let challenge = v.www_authenticate(&err);
@@ -1861,6 +1910,7 @@ fn rejects_cnf_bound_token_as_bearer_even_when_dpop_not_required() {
             dpop: None,
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "dpop proof is required",
     );
@@ -1895,6 +1945,7 @@ fn accepts_cnf_bound_bearer_when_a_valid_proof_is_supplied() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -1931,7 +1982,367 @@ fn rejects_token_missing_iat() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "missing iat",
     );
+}
+
+// =================================================================================================
+// RFC 8705 certificate-bound (mTLS) proof-of-possession — the tiered-PoP fail-closed matrix.
+//
+// A cert-bound token (`cnf.x5t#S256` present) satisfies PoP by MATCHING the RS-verified client-cert
+// thumbprint (`AuthRequest::client_cert_x5t_s256`), NOT by a DPoP proof. DPoP stays MANDATORY for
+// every non-cert-bound token, and there is no cross-substitution (no downgrade / no confusion).
+// =================================================================================================
+
+/// Mint a cert-bound (RFC 8705) access token bound to `cert` (a `cnf.x5t#S256` value), with no
+/// `cnf.jkt`. Presented as `Bearer` — mTLS tokens carry no DPoP scheme.
+fn cert_bound_token(issuer: &KeyKit, cert: &str) -> String {
+    mint_access_token(
+        issuer,
+        &TokenOpts {
+            cnf_x5t_s256: Some(serde_json::json!(cert)),
+            ..Default::default()
+        },
+    )
+}
+
+/// (3) cert-bound token + MATCHING RS-verified thumbprint → ACCEPT, even under `require_dpop=true`
+/// and with NO DPoP proof. The certificate is the proof-of-possession.
+#[test]
+fn accepts_cert_bound_bearer_with_matching_cert_under_require_dpop() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let cert = cert_thumbprint(0x42);
+    let token = cert_bound_token(&issuer, &cert);
+    let creds = v
+        .verify(&AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert.clone()),
+        })
+        .expect("matching cert-bound bearer must be accepted");
+    assert_eq!(creds.web_id.as_deref(), Some(WEBID));
+    // The binding is surfaced; no DPoP binding present.
+    assert_eq!(creds.cnf_x5t_s256_thumbprint(), Some(cert.as_str()));
+    assert_eq!(creds.cnf_jkt, None);
+}
+
+/// (1) cert-bound token + NO client certificate on the connection → reject (no PoP).
+#[test]
+fn rejects_cert_bound_bearer_without_client_cert() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = cert_bound_token(&issuer, &cert_thumbprint(0x42));
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: None,
+        },
+        "requires a client certificate",
+    );
+}
+
+/// (2) cert-bound token + WRONG (different) client-cert thumbprint → reject.
+#[test]
+fn rejects_cert_bound_bearer_with_wrong_cert() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = cert_bound_token(&issuer, &cert_thumbprint(0x42));
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            // A DIFFERENT certificate than the token is bound to.
+            client_cert_x5t_s256: Some(cert_thumbprint(0x43)),
+        },
+        "confirmation mismatch",
+    );
+}
+
+/// (4) a NON-cert-bound plain Bearer under `require_dpop=true` is STILL rejected — even if the
+/// connection presents a client certificate. A certificate cannot rescue an unbound token; DPoP
+/// stays mandatory (no weakening).
+#[test]
+fn rejects_plain_bearer_under_require_dpop_even_with_client_cert() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    // No cnf at all.
+    let token = mint_access_token(&issuer, &TokenOpts::default());
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x42)),
+        },
+        "bearer not accepted",
+    );
+}
+
+/// (6, malformed) a PRESENT-but-MALFORMED `cnf.x5t#S256` fails closed and is never treated as an
+/// absent binding. Presented via the `DPoP` scheme so it reaches the in-`validate_token` malformed
+/// guard (under `require_dpop` a malformed-cnf Bearer is instead rejected at the scheme gate — see the
+/// next test — but either way it is rejected).
+#[test]
+fn rejects_malformed_cert_binding() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    // Valid base64url but only 16 decoded bytes — not a 32-byte SHA-256 → Malformed.
+    let short = base64_encode(&[0u8; 16]);
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_x5t_s256: Some(serde_json::json!(short)),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x42)),
+        },
+        "malformed",
+    );
+}
+
+/// (6, malformed under Bearer/require_dpop) a malformed-cnf Bearer never sneaks past the scheme gate:
+/// `token_is_cert_bound` is false for a malformed binding, so it is rejected as a plain Bearer.
+#[test]
+fn rejects_malformed_cert_bound_bearer_at_scheme_gate() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            // Non-string value → malformed.
+            cnf_x5t_s256: Some(serde_json::json!(42)),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x42)),
+        },
+        "bearer not accepted",
+    );
+}
+
+/// (7, no downgrade) a DPoP-bound token (`cnf.jkt` only) presented as `Bearer` under `require_dpop`,
+/// WITH a client certificate on the connection, is rejected at the scheme gate — a certificate can
+/// never downgrade a DPoP-bound token to a certificate-bound one.
+#[test]
+fn rejects_dpop_bound_token_as_bearer_even_with_client_cert() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x42)),
+        },
+        "bearer not accepted",
+    );
+}
+
+/// (5, no confusion) a DPoP-bound token presented as `DPoP` with NO proof still requires the proof —
+/// a presented client certificate does not substitute for a missing DPoP proof.
+#[test]
+fn dpop_bound_token_requires_proof_cert_does_not_substitute() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: None, // no proof
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x42)),
+        },
+        "dpop proof is required",
+    );
+}
+
+/// (no confusion) a cert-bound token (`cnf.x5t#S256` only) is NOT satisfied by a DPoP proof alone:
+/// with the correct cert absent, even a well-formed DPoP proof presented alongside does not admit it.
+#[test]
+fn cert_bound_token_not_satisfied_by_dpop_proof_alone() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let cert = cert_thumbprint(0x42);
+    let token = cert_bound_token(&issuer, &cert);
+    // A syntactically valid proof (its cnf.jkt binding is irrelevant — the token carries no cnf.jkt).
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("Bearer {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: None, // the certificate is what is required, and it is absent
+        },
+        "requires a client certificate",
+    );
+}
+
+/// (multi-binding) a token bound BOTH ways (`cnf.jkt` + `cnf.x5t#S256`) requires BOTH: a valid DPoP
+/// proof AND a matching certificate → ACCEPT (strictly stronger; never a bypass).
+#[test]
+fn both_bound_token_requires_both_and_accepts_when_both_present() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let cert = cert_thumbprint(0x42);
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            cnf_x5t_s256: Some(serde_json::json!(cert)),
+            ..Default::default()
+        },
+    );
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    let creds = v
+        .verify(&AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert.clone()),
+        })
+        .expect("both-bound token with a valid proof AND matching cert must be accepted");
+    assert_eq!(creds.web_id.as_deref(), Some(WEBID));
+    assert_eq!(creds.cnf_jkt.as_deref(), Some(client.thumbprint.as_str()));
+    assert_eq!(creds.cnf_x5t_s256_thumbprint(), Some(cert.as_str()));
+}
+
+/// (multi-binding, no bypass) a both-bound token with a valid proof but the WRONG certificate is
+/// rejected — the cert half is still enforced.
+#[test]
+fn both_bound_token_rejected_when_cert_wrong_despite_valid_proof() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            cnf_x5t_s256: Some(serde_json::json!(cert_thumbprint(0x42))),
+            ..Default::default()
+        },
+    );
+    let proof = mint_dpop_proof(
+        &client,
+        METHOD,
+        URL,
+        &ProofOpts {
+            access_token: Some(token.clone()),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: Some(proof),
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert_thumbprint(0x43)), // wrong cert
+        },
+        "confirmation mismatch",
+    );
+}
+
+/// (multi-binding, no bypass) a both-bound token with a matching certificate but a MISSING DPoP proof
+/// is rejected — the DPoP half is still enforced (a cert can't substitute for the proof).
+#[test]
+fn both_bound_token_rejected_when_proof_missing_despite_matching_cert() {
+    let issuer = KeyKit::generate();
+    let client = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let cert = cert_thumbprint(0x42);
+    let token = mint_access_token(
+        &issuer,
+        &TokenOpts {
+            cnf_jkt: Some(client.thumbprint.clone()),
+            cnf_x5t_s256: Some(serde_json::json!(cert)),
+            ..Default::default()
+        },
+    );
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: None, // proof missing
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert),
+        },
+        "dpop proof is required",
+    );
+}
+
+/// base64url-no-pad encode helper for the malformed-length test.
+fn base64_encode(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }

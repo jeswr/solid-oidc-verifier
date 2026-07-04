@@ -70,6 +70,7 @@ fn athless_request(
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
+        client_cert_x5t_s256: None,
     };
     (token, req)
 }
@@ -131,6 +132,7 @@ fn compat_still_accepts_correct_ath() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         })
         .unwrap();
     assert_eq!(creds.web_id.as_deref(), Some(WEBID));
@@ -180,6 +182,7 @@ fn compat_rejects_cnf_jkt_mismatch() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "confirmation mismatch",
     );
@@ -292,6 +295,7 @@ fn compat_rejects_bad_access_token_signature() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "verification failed",
     );
@@ -328,6 +332,7 @@ fn compat_rejects_token_not_dpop_bound() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "not dpop-bound",
     );
@@ -399,6 +404,7 @@ fn compat_rejects_malformed_access_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "",
     );
@@ -450,6 +456,7 @@ fn compat_rejects_present_but_wrong_ath() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "ath",
     );
@@ -490,6 +497,7 @@ fn compat_rejects_ath_for_different_token() {
             dpop: Some(proof),
             method: METHOD.into(),
             url: URL.into(),
+            client_cert_x5t_s256: None,
         },
         "ath",
     );
