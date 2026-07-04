@@ -2236,6 +2236,50 @@ fn cert_bound_token_not_satisfied_by_dpop_proof_alone() {
     );
 }
 
+/// (no confusion, roborev) an EXPLICIT `DPoP` presentation is always DPoP-validated: a cert-bound
+/// token presented under the `DPoP` scheme is rejected (it carries no cnf.jkt) even with a matching
+/// certificate — the RFC 8705 cert exemption applies ONLY to the blanket `require_dpop` posture, never
+/// to an explicit DPoP-scheme request. A cert-bound token must be presented as `Bearer`.
+#[test]
+fn rejects_cert_bound_token_presented_as_dpop_scheme() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(true));
+    let cert = cert_thumbprint(0x42);
+    let token = cert_bound_token(&issuer, &cert);
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert), // matching cert — still rejected: DPoP scheme needs a proof
+        },
+        "dpop proof is required",
+    );
+}
+
+/// (no confusion, roborev) the same holds under `require_dpop=false`: an explicit `DPoP` presentation
+/// of a cert-bound token is still DPoP-validated and rejected (the cert cannot satisfy the DPoP scheme).
+#[test]
+fn rejects_cert_bound_token_as_dpop_scheme_even_without_require_dpop() {
+    let issuer = KeyKit::generate();
+    let v = build_verifier(&issuer, config(false));
+    let cert = cert_thumbprint(0x42);
+    let token = cert_bound_token(&issuer, &cert);
+    assert_401(
+        &v,
+        &AuthRequest {
+            authorization: Some(format!("DPoP {token}")),
+            dpop: None,
+            method: METHOD.into(),
+            url: URL.into(),
+            client_cert_x5t_s256: Some(cert),
+        },
+        "dpop proof is required",
+    );
+}
+
 /// (multi-binding) a token bound BOTH ways (`cnf.jkt` + `cnf.x5t#S256`) requires BOTH: a valid DPoP
 /// proof AND a matching certificate → ACCEPT (strictly stronger; never a bypass).
 #[test]

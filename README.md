@@ -141,6 +141,11 @@ let req = AuthRequest {
     // The EXACT reconstructed request URL the client signed into the proof's `htu`
     // (proxy-aware, scheme/host/port/path; query + fragment stripped).
     url: "https://pod.example/alice/data".to_string(),
+    // For an RFC 8705 certificate-bound (mTLS) Bearer token, set this to the RS-verified TLS
+    // peer-certificate thumbprint (`base64url(SHA-256(DER))`, no pad); leave it `None` (the
+    // `Default`) for DPoP / plain-Bearer requests. `AuthRequest` derives `Default`, so you can
+    // also write `..Default::default()` instead of listing this field.
+    client_cert_x5t_s256: None,
 };
 
 match verifier.verify(&req) {
@@ -167,7 +172,7 @@ match verifier.verify(&req) {
 | Access-token RFC-9068 validation | ✅ implemented + tested | — |
 | DPoP RFC-9449 proof validation | ✅ implemented + tested | — |
 | RFC 7638 `cnf.jkt` thumbprint | ✅ implemented + tested | — |
-| RFC 8705 `cnf.x5t#S256` mTLS binding (surfaced only — three-state absent/valid/malformed; not verified here) | ✅ accessor + tested | — |
+| RFC 8705 `cnf.x5t#S256` mTLS binding — ENFORCED as tiered PoP (a cert-bound Bearer is admitted under `require_dpop` iff `AuthRequest::client_cert_x5t_s256` matches, constant-time; malformed → fail-closed; both-bound → both required) + surfaced (three-state absent/valid/malformed) | ✅ implemented + accessor + tested | — |
 | `ath` three-state compat | ✅ implemented + tested | — |
 | `jti` replay (trait + in-memory: atomic check-and-set, never-evict-live, fail-closed at capacity) | ✅ implemented + tested | shared Redis `SET NX` impl (`ReplayStore`) |
 | SSRF address classifier + URL gate | ✅ implemented + tested | — |

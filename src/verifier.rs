@@ -190,12 +190,16 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
             return Err(invalid_token("Token issuer is not trusted."));
         }
 
-        // A request presenting `DPoP <token>` MUST be validated as DPoP-bound even when
-        // `require_dpop=false` (matching the TS Copilot-#5 fix).
-        let dpop = parsed.scheme == "dpop" || self.config.require_dpop;
+        // An EXPLICIT `DPoP <token>` presentation MUST be validated as DPoP-bound even when
+        // `require_dpop=false` (matching the TS Copilot-#5 fix). This signal is kept SEPARATE from the
+        // blanket `require_dpop` posture: the RFC 8705 cert-bound exemption applies ONLY to the
+        // posture, never to an explicit DPoP-scheme request — so a cert-bound token presented under the
+        // `DPoP` scheme is still required to be DPoP-bound (and thus rejected, since it carries no
+        // cnf.jkt). A cert-bound token must be presented as `Bearer` (RFC 8705 tokens are Bearer).
+        let dpop_scheme = parsed.scheme == "dpop";
 
-        // (4)+(5) access token + DPoP proof.
-        let claims = self.validate_token(req, &parsed, &claimed_issuer, dpop)?;
+        // (4)+(5) access token + proof-of-possession.
+        let claims = self.validate_token(req, &parsed, &claimed_issuer, dpop_scheme)?;
 
         // (6) webid + authorized party.
         let web_id = self.extract_webid(&claims)?;
@@ -240,7 +244,7 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         req: &AuthRequest,
         parsed: &Parsed,
         claimed_issuer: &str,
-        dpop: bool,
+        dpop_scheme: bool,
     ) -> Result<Claims, VerifyError> {
         // Access-token signature + RFC-9068 claims (same in both strict and compat — the difference is
         // only the proof's ath requirement).
@@ -268,18 +272,24 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         };
         let is_cert_bound = cert_thumbprint.is_some();
 
-        // Proof-of-possession routing — fail-closed, no downgrade, no confusion:
-        //  * A DPoP-BOUND token (`cnf.jkt`) ALWAYS requires a valid DPoP proof, regardless of scheme /
-        //    `require_dpop` (Finding #1, roborev High). A captured bound token presented as `Bearer`
-        //    would otherwise skip proof-of-possession — a token-replay downgrade. A presented client
+        // Proof-of-possession routing — fail-closed, no downgrade, no confusion. A DPoP proof is
+        // required whenever ANY of:
+        //  * `cnf.jkt` is present — a DPoP-BOUND token ALWAYS needs its proof, regardless of scheme /
+        //    posture (Finding #1, roborev High). A captured bound token presented as `Bearer` would
+        //    otherwise skip proof-of-possession — a token-replay downgrade. A presented client
         //    certificate can NEVER substitute for a missing/invalid proof on such a token.
-        //  * The blanket DPoP posture (`dpop` = DPoP scheme OR `require_dpop`) requires a DPoP proof
-        //    UNLESS the token is cert-bound, whose PoP is satisfied by the certificate instead (5b).
-        //  * A CERT-BOUND token (`cnf.x5t#S256`) ALWAYS requires the RS-verified client-certificate
-        //    thumbprint to match (5b, below) — a DPoP proof alone can never substitute for it.
-        //  * A token carrying BOTH bindings requires BOTH: `must_dpop` stays true (cnf.jkt present) AND
-        //    the cert match is enforced. Strictly stronger than either alone — never a bypass.
-        let must_dpop = cnf_jkt.is_some() || (dpop && !is_cert_bound);
+        //  * the request used the explicit `DPoP` scheme — an explicit DPoP presentation is ALWAYS
+        //    DPoP-validated (the TS Copilot-#5 invariant). The cert exemption below does NOT apply to
+        //    it, so a cert-bound token presented under `DPoP` is rejected (it carries no cnf.jkt) — a
+        //    cert-bound token must be presented as `Bearer` (RFC 8705).
+        //  * the blanket `require_dpop` posture is on AND the token is NOT cert-bound. This is the ONE
+        //    place the cert exemption applies: a cert-bound Bearer under `require_dpop` satisfies PoP by
+        //    the certificate (5b) instead of a DPoP proof.
+        // A CERT-BOUND token additionally ALWAYS requires the client-certificate match (5b) — a DPoP
+        // proof alone can never substitute for it. A token bound BOTH ways requires BOTH (cnf.jkt keeps
+        // `must_dpop` true AND the cert match is enforced) — strictly stronger; never a bypass.
+        let must_dpop =
+            cnf_jkt.is_some() || dpop_scheme || (self.config.require_dpop && !is_cert_bound);
 
         // (5a) DPoP proof.
         if must_dpop {
