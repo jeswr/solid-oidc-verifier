@@ -86,6 +86,7 @@
 //!     dpop: Some("<proof>".to_string()),
 //!     method: "GET".to_string(),
 //!     url: "https://pod.example/alice/data".to_string(),
+//!     ..Default::default() // `client_cert_x5t_s256` — set for an RFC 8705 cert-bound Bearer
 //! };
 //! match verifier.verify(&req) {
 //!     Ok(token) if token.is_public() => { /* unauthenticated — public resources only */ }

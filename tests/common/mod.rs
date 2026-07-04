@@ -76,6 +76,10 @@ pub struct TokenOpts {
     pub omit_webid: bool,
     pub webid_claim: Option<String>,
     pub cnf_jkt: Option<String>,
+    /// `Some(v)` inserts `cnf.x5t#S256 = v` (RFC 8705 mTLS binding). A `Value` (not `String`) so a test
+    /// can inject a MALFORMED binding (a number, a bad-base64url string, wrong length) as well as a
+    /// well-formed thumbprint. Combined freely with `cnf_jkt` to mint a both-bound token.
+    pub cnf_x5t_s256: Option<Value>,
     pub omit_cnf: bool,
     pub alg: Option<String>,
     pub expires_at: Option<i64>,
@@ -148,10 +152,15 @@ pub fn mint_access_token(issuer_key: &KeyKit, opts: &TokenOpts) -> String {
             json!(opts.webid.clone().unwrap_or_else(|| WEBID.into())),
         );
     }
-    if !opts.omit_cnf {
+    if !opts.omit_cnf && (opts.cnf_jkt.is_some() || opts.cnf_x5t_s256.is_some()) {
+        let mut cnf = Map::new();
         if let Some(jkt) = &opts.cnf_jkt {
-            claims.insert("cnf".into(), json!({ "jkt": jkt }));
+            cnf.insert("jkt".into(), json!(jkt));
         }
+        if let Some(x5t) = &opts.cnf_x5t_s256 {
+            cnf.insert("x5t#S256".into(), x5t.clone());
+        }
+        claims.insert("cnf".into(), Value::Object(cnf));
     }
     let iat = opts.issued_at.unwrap_or_else(now);
     claims.insert("iat".into(), json!(iat));
@@ -165,6 +174,13 @@ pub fn mint_access_token(issuer_key: &KeyKit, opts: &TokenOpts) -> String {
 /// base64url(SHA-256(token)) — the DPoP `ath`.
 pub fn ath(token: &str) -> String {
     b64url(&Sha256::digest(token.as_bytes()))
+}
+
+/// A well-formed RFC 8705 `cnf.x5t#S256` value: base64url-no-pad of a deterministic 32-byte
+/// (SHA-256-sized) certificate digest. Distinct `seed`s give distinct thumbprints, so a test can model
+/// "the presented certificate is a DIFFERENT one" by using a different seed.
+pub fn cert_thumbprint(seed: u8) -> String {
+    b64url(&[seed; 32])
 }
 
 /// Options for minting a DPoP proof.

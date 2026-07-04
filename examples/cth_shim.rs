@@ -149,6 +149,9 @@ async fn handle(State(state): State<Arc<AppState>>, req: Request<Body>) -> Respo
         dpop: header_str(req.headers(), "dpop"),
         method,
         url,
+        // This plaintext CTH shim terminates no client TLS certificate, so there is no RFC 8705
+        // certificate-bound token path here.
+        client_cert_x5t_s256: None,
     };
 
     match state.verifier.verify(&auth_req) {

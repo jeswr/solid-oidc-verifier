@@ -84,6 +84,7 @@ fn dpop_request(issuer: &KeyKit, client: &KeyKit) -> AuthRequest {
         dpop: Some(proof),
         method: METHOD.into(),
         url: URL.into(),
+        client_cert_x5t_s256: None,
     }
 }
 

@@ -8,11 +8,16 @@
 //!
 //! Order of checks (cheapest-first, matching TS `authenticate`):
 //!   1. parse Authorization → scheme/token (absent ⇒ public credentials).
-//!   2. scheme vs DPoP policy (Bearer rejected when `require_dpop`).
+//!   2. scheme vs DPoP policy (Bearer rejected when `require_dpop`, EXCEPT a cert-bound token whose
+//!      PoP is the TLS client certificate — RFC 8705 — which is admitted here and enforced at (5b)).
 //!   3. trusted-issuer allowlist (from the *unverified* iss, before key resolution).
 //!   4. access-token validation (signature, alg, typ, RFC-9068 claims, iss, aud, temporal, cnf).
-//!   5. DPoP-proof validation (typ, alg, embedded public JWK, signature, htm, htu, iat, jti, ath?,
-//!      cnf.jkt == jkt(proof)).
+//!   5. proof-of-possession (fail-closed, tiered): (5a) a DPoP proof (typ, alg, embedded public JWK,
+//!      signature, htm, htu, iat, jti, ath?, cnf.jkt == jkt(proof)) whenever the token is DPoP-bound
+//!      or the DPoP posture applies to a non-cert-bound token; and/or (5b) a client-certificate
+//!      thumbprint match (RFC 8705 `cnf.x5t#S256` == the RS-verified `client_cert_x5t_s256`) whenever
+//!      the token is cert-bound. A DPoP-bound token can NEVER be satisfied by a certificate, nor a
+//!      cert-bound token by a DPoP proof alone; a token bound BOTH ways requires BOTH.
 //!   6. webid extraction (https URL) + authorized-party allowlist.
 //!   7. jti replay (fail-closed) — cheap, before the expensive bidirectional fetch.
 //!   8. bidirectional WebID↔issuer check (strict 401 / warn / off).
@@ -36,7 +41,7 @@ use crate::webid::{validate_webid_claim, BidirectionalMode, WebIdProfileError};
 /// The per-request inputs (TS `AuthRequest`). The host's HTTP layer assembles this; the verifier is
 /// transport-agnostic. `url` is the exact reconstructed request URL (proxy-aware, query stripped) the
 /// client signed into the proof's `htu`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AuthRequest {
     pub authorization: Option<String>,
     pub dpop: Option<String>,
@@ -44,6 +49,14 @@ pub struct AuthRequest {
     pub method: String,
     /// The reconstructed request URL (scheme/host/port/path; query+fragment stripped).
     pub url: String,
+    /// The RFC 8705 §3.1 certificate thumbprint the RS extracted from the TLS peer certificate on
+    /// THIS connection — `base64url(SHA-256(DER(cert)))`, no padding — or `None` when the connection
+    /// presented no client certificate. This is the RS asserting "the TLS layer authenticated a
+    /// client certificate with THIS thumbprint"; it is the proof-of-possession for a certificate-bound
+    /// (RFC 8705) access token, in place of a DPoP proof. The verifier consults it ONLY when the token
+    /// carries a well-formed `cnf.x5t#S256` binding, and matches it constant-time. It must be encoded
+    /// the same way `cnf.x5t#S256` is (base64url, no padding) or the match will (fail-closed) reject.
+    pub client_cert_x5t_s256: Option<String>,
 }
 
 /// The RFC 8705 §3.1 `cnf.x5t#S256` mTLS certificate-thumbprint confirmation as read off a verified
@@ -143,7 +156,16 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         // (2) scheme vs DPoP policy.
         match parsed.scheme.as_str() {
             "bearer" => {
-                if self.config.require_dpop {
+                // Under `require_dpop`, a Bearer-presented token is admitted here ONLY when it carries
+                // a well-formed RFC 8705 `cnf.x5t#S256` mTLS certificate binding — its
+                // proof-of-possession is the client certificate at the TLS layer (surfaced via the
+                // request's `client_cert_x5t_s256`), not a DPoP proof. This peek is UNVERIFIED and used
+                // purely for ROUTING: the binding is re-read from the signature-verified claims and the
+                // certificate-thumbprint match is enforced fail-closed in `validate_token` (5b), so a
+                // forged/garbage `cnf` cannot get past that. Every OTHER Bearer — a plain unbound token,
+                // or a `cnf.jkt` DPoP-bound token mis-presented as Bearer (no `cnf.x5t#S256`) — is still
+                // rejected here, keeping DPoP mandatory for all non-cert-bound tokens.
+                if self.config.require_dpop && !token_is_cert_bound(&parsed.token) {
                     return Err(invalid_request(
                         "DPoP-bound token required; Bearer not accepted.",
                     ));
@@ -168,12 +190,16 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
             return Err(invalid_token("Token issuer is not trusted."));
         }
 
-        // A request presenting `DPoP <token>` MUST be validated as DPoP-bound even when
-        // `require_dpop=false` (matching the TS Copilot-#5 fix).
-        let dpop = parsed.scheme == "dpop" || self.config.require_dpop;
+        // An EXPLICIT `DPoP <token>` presentation MUST be validated as DPoP-bound even when
+        // `require_dpop=false` (matching the TS Copilot-#5 fix). This signal is kept SEPARATE from the
+        // blanket `require_dpop` posture: the RFC 8705 cert-bound exemption applies ONLY to the
+        // posture, never to an explicit DPoP-scheme request — so a cert-bound token presented under the
+        // `DPoP` scheme is still required to be DPoP-bound (and thus rejected, since it carries no
+        // cnf.jkt). A cert-bound token must be presented as `Bearer` (RFC 8705 tokens are Bearer).
+        let dpop_scheme = parsed.scheme == "dpop";
 
-        // (4)+(5) access token + DPoP proof.
-        let claims = self.validate_token(req, &parsed, &claimed_issuer, dpop)?;
+        // (4)+(5) access token + proof-of-possession.
+        let claims = self.validate_token(req, &parsed, &claimed_issuer, dpop_scheme)?;
 
         // (6) webid + authorized party.
         let web_id = self.extract_webid(&claims)?;
@@ -218,22 +244,54 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
         req: &AuthRequest,
         parsed: &Parsed,
         claimed_issuer: &str,
-        dpop: bool,
+        dpop_scheme: bool,
     ) -> Result<Claims, VerifyError> {
         // Access-token signature + RFC-9068 claims (same in both strict and compat — the difference is
         // only the proof's ath requirement).
         let claims = self.validate_access_token(parsed, claimed_issuer)?;
 
-        // (Finding #1, roborev High) A DPoP-BOUND token (carrying `cnf.jkt`) MUST have its proof
-        // verified regardless of the presentation scheme or `require_dpop`. Otherwise a captured
-        // bound token presented as `Bearer` (when `require_dpop=false`) would be accepted without
-        // proof-of-possession — a token-replay downgrade. So `must_dpop` is true whenever the request
-        // is DPoP-scheme / DPoP-required OR the token itself is cnf-bound. (The `oauth4webapi` library
-        // the TS verifier delegates to enforces exactly this: it runs its DPoP step whenever the token
-        // carries `cnf.jkt`.)
+        // Read BOTH confirmation bindings from the (now signature-verified) claims. They are
+        // independent — a token may carry `cnf.jkt` (DPoP, RFC 9449), `cnf.x5t#S256` (mTLS, RFC 8705),
+        // both, or neither.
         let cnf_jkt = extract_cnf_jkt(&claims);
-        let must_dpop = dpop || cnf_jkt.is_some();
+        let cnf_x5t = extract_cnf_x5t_s256(&claims);
 
+        // A cert binding that is PRESENT but MALFORMED must fail closed. It is NOT an unbound token,
+        // so it must never fall through as "absent-and-DPoP-required" (which could route a broken
+        // cert-bound token onto the plain-bearer rejection or, worse, silently drop the binding). The
+        // three-state `X5tS256` exists precisely so this case is distinguishable from absence.
+        if matches!(cnf_x5t, Some(X5tS256::Malformed)) {
+            return Err(invalid_token(
+                "Access token certificate binding (cnf.x5t#S256) is malformed.",
+            ));
+        }
+        // The well-formed cert thumbprint, if any (Malformed already rejected above; `None` = absent).
+        let cert_thumbprint = match &cnf_x5t {
+            Some(X5tS256::Thumbprint(t)) => Some(t.clone()),
+            _ => None,
+        };
+        let is_cert_bound = cert_thumbprint.is_some();
+
+        // Proof-of-possession routing — fail-closed, no downgrade, no confusion. A DPoP proof is
+        // required whenever ANY of:
+        //  * `cnf.jkt` is present — a DPoP-BOUND token ALWAYS needs its proof, regardless of scheme /
+        //    posture (Finding #1, roborev High). A captured bound token presented as `Bearer` would
+        //    otherwise skip proof-of-possession — a token-replay downgrade. A presented client
+        //    certificate can NEVER substitute for a missing/invalid proof on such a token.
+        //  * the request used the explicit `DPoP` scheme — an explicit DPoP presentation is ALWAYS
+        //    DPoP-validated (the TS Copilot-#5 invariant). The cert exemption below does NOT apply to
+        //    it, so a cert-bound token presented under `DPoP` is rejected (it carries no cnf.jkt) — a
+        //    cert-bound token must be presented as `Bearer` (RFC 8705).
+        //  * the blanket `require_dpop` posture is on AND the token is NOT cert-bound. This is the ONE
+        //    place the cert exemption applies: a cert-bound Bearer under `require_dpop` satisfies PoP by
+        //    the certificate (5b) instead of a DPoP proof.
+        // A CERT-BOUND token additionally ALWAYS requires the client-certificate match (5b) — a DPoP
+        // proof alone can never substitute for it. A token bound BOTH ways requires BOTH (cnf.jkt keeps
+        // `must_dpop` true AND the cert match is enforced) — strictly stronger; never a bypass.
+        let must_dpop =
+            cnf_jkt.is_some() || dpop_scheme || (self.config.require_dpop && !is_cert_bound);
+
+        // (5a) DPoP proof.
         if must_dpop {
             let proof = req.dpop.as_deref().ok_or_else(|| {
                 invalid_token_dpop("DPoP proof is required (no DPoP HTTP Header).")
@@ -250,7 +308,37 @@ impl<J: JwksProvider, R: ReplayStore> Verifier<J, R> {
             self.validate_dpop_proof(req, proof, &parsed.token, &cnf_jkt, require_ath)?;
         }
 
+        // (5b) Certificate binding (RFC 8705). Enforced whenever the token is cert-bound — including a
+        // both-bound token that already passed (5a). Fail-closed: no presented cert, or a mismatch,
+        // rejects.
+        if let Some(expected) = &cert_thumbprint {
+            self.validate_cert_binding(req, expected)?;
+        }
+
         Ok(claims)
+    }
+
+    /// Validate the RFC 8705 §3.1 certificate binding: the token's `cnf.x5t#S256` must equal the
+    /// RS-verified client-certificate thumbprint (`req.client_cert_x5t_s256`) presented on this TLS
+    /// connection, compared in constant time. Fail-closed — a token bound to a certificate but
+    /// presented on a connection with NO client certificate (or a DIFFERENT one) is rejected. This is
+    /// the certificate's proof-of-possession, standing in for a DPoP proof.
+    fn validate_cert_binding(
+        &self,
+        req: &AuthRequest,
+        expected_thumbprint: &str,
+    ) -> Result<(), VerifyError> {
+        let presented = req.client_cert_x5t_s256.as_deref().ok_or_else(|| {
+            invalid_token(
+                "Certificate-bound access token requires a client certificate (none presented).",
+            )
+        })?;
+        if !constant_time_eq(presented.as_bytes(), expected_thumbprint.as_bytes()) {
+            return Err(invalid_token(
+                "Certificate-bound access token confirmation mismatch (cnf.x5t#S256 != presented client certificate).",
+            ));
+        }
+        Ok(())
     }
 
     /// Validate the access-token JWS + RFC-9068 claims. Replicates what
@@ -567,6 +655,33 @@ fn parse_authorization(header: Option<&str>) -> Option<Parsed> {
     Some(Parsed { scheme, token })
 }
 
+/// Whether a token carries a WELL-FORMED RFC 8705 `cnf.x5t#S256` mTLS certificate binding, read from
+/// the token's UNVERIFIED claims. Used ONLY at the scheme gate to route a cert-bound Bearer past the
+/// `require_dpop` rejection — the actual security decision (the certificate-thumbprint match) is made
+/// later, in [`Verifier::validate_cert_binding`], against the SIGNATURE-VERIFIED claims. A malformed
+/// or absent binding, or an unparseable token, yields `false` (fail-closed: such a Bearer stays
+/// rejected under `require_dpop`).
+fn token_is_cert_bound(token: &str) -> bool {
+    peek_claims(token)
+        .as_ref()
+        .and_then(Value::as_object)
+        .is_some_and(|claims| matches!(extract_cnf_x5t_s256(claims), Some(X5tS256::Thumbprint(_))))
+}
+
+/// Constant-time byte-equality — avoids leaking, via timing, how many leading bytes of a candidate
+/// certificate thumbprint match the token's binding. A length mismatch short-circuits (thumbprints are
+/// fixed-width, so a differing length is already a definitive non-match and carries no secret prefix).
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// base64url(SHA-256(token)) — the DPoP `ath` value (TS `ath` helper).
 fn ath(token: &str) -> String {
     let digest = Sha256::digest(token.as_bytes());
@@ -797,6 +912,58 @@ mod tests {
         );
         assert_eq!(extract_cnf_jkt(&c), Some("the-jkt".to_string()));
         assert_eq!(extract_cnf_x5t_s256(&c), Some(X5tS256::Thumbprint(t)));
+    }
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(constant_time_eq(b"abcDEF-_", b"abcDEF-_"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        // Length mismatch (and prefix match) is a non-match, never a panic.
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+        assert!(!constant_time_eq(b"abcd", b"abc"));
+    }
+
+    #[test]
+    fn token_is_cert_bound_true_only_for_wellformed_x5t() {
+        // A helper to build an UNSIGNED compact JWS (header.payload.sig) whose payload is `claims` —
+        // `peek_claims` only base64url-decodes the payload segment, it does not verify the signature.
+        fn tok(claims: Value) -> String {
+            let b64 = |v: &Value| {
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(serde_json::to_vec(v).unwrap())
+            };
+            format!(
+                "{}.{}.{}",
+                b64(&serde_json::json!({ "alg": "ES256", "typ": "at+jwt" })),
+                b64(&claims),
+                "sig"
+            )
+        }
+        let good = valid_x5t(0x5A);
+        // Well-formed cert binding → true.
+        assert!(token_is_cert_bound(&tok(
+            serde_json::json!({ "cnf": { "x5t#S256": good } })
+        )));
+        // A both-bound token is still cert-bound.
+        assert!(token_is_cert_bound(&tok(
+            serde_json::json!({ "cnf": { "jkt": "j", "x5t#S256": good } })
+        )));
+        // Malformed cert binding → false (fail-closed: stays a rejected Bearer under require_dpop).
+        assert!(!token_is_cert_bound(&tok(
+            serde_json::json!({ "cnf": { "x5t#S256": "###" } })
+        )));
+        // DPoP-only (cnf.jkt) → false.
+        assert!(!token_is_cert_bound(&tok(
+            serde_json::json!({ "cnf": { "jkt": "j" } })
+        )));
+        // No cnf → false.
+        assert!(!token_is_cert_bound(&tok(
+            serde_json::json!({ "sub": "x" })
+        )));
+        // Unparseable token → false, never panics.
+        assert!(!token_is_cert_bound("not-a-jwt"));
+        assert!(!token_is_cert_bound(""));
     }
 
     #[test]
